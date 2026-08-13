@@ -1,6 +1,6 @@
-biopython==1.76
-psutil==5.7.0
-xlsxwriter==1.4.3
+biopython>=1.79
+psutil>=5.7.0
+xlsxwriter>=1.4.3
 
 # Foldseek search modes only (-m foldseek / diamond-foldseek / mmseqs-foldseek).
 # Equivalent to: pip install eggnog-mapper[foldseek]

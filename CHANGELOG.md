@@ -44,8 +44,153 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The Apptainer image now installs the `foldseek` binary; build with
   `--build-arg INSTALL_FOLDSEEK_DEPS=true` to bake in the Python stack too.
 
+---
+
+## [3.0.0-beta6] — 2026-08-12
+
+### Removed / renamed (pre-stable CLI cleanup)
+
+- **`--db BACKEND` removed.** Data location is set exclusively via `--data_dir`
+  or the `EGGNOG_DATA_DIR` environment variable (both `emapper.py` and
+  `download_eggnog_data.py`). The internal default backend still resolves when
+  neither is set.
+- **`--translate` removed; translation is now automatic.** `--itype cds`
+  always translates before the protein search (previously required
+  `--translate`); `--itype genome`/`metagenome` gene prediction is unchanged
+  (predicted ORFs remain in their existing default representation).
+- **`--mp_start_method` removed.** The annotation pool hard-codes the fork
+  start method (already the effective default for eggNOG-mapper). Standalone
+  `hmm_server.py` / `hmm_worker.py` still expose the flag.
+- **`--unsorted_seeds` removed; file-based seed inputs are always sorted** by
+  seed ortholog id before annotation. Byte-identical to the previous default;
+  the sort-vs-unsorted resume mode guard was removed. The in-memory
+  (genome/metagenome) hits path is unchanged. The `go_namespace_split` output
+  header marker stays.
+- **HMMER as a search mode removed** (`-m hmmer` no longer accepted). The
+  associated HMMER-search-only options were removed: `-d/--database`,
+  `--servers_list`, `--qtype`, `--dbtype`, `--usemem`, `--Z`, `--cut_ga`,
+  `--clean_overlaps`, `--hmm_maxhits`, `--report_no_hits`, `--hmm_maxseqlen`,
+  plus the `hmm_mapper.py` entrypoint. `--pfam_realign` (realign / denovo) is
+  unaffected — it drives its own hmmpgmd server internally, and the
+  `--port`, `--end_port`, `--num_servers`, `--num_workers`,
+  `--timeout_load_server` options were moved into the Annotation group where
+  they now serve `--pfam_realign` only. The standalone `hmm_server.py` /
+  `hmm_worker.py` scripts (for pre-starting an hmmpgmd server) are kept.
+- **Diamond flags renamed to a consistent `--dmnd_*` prefix** (flag == dest):
+  `--sensmode`→`--dmnd_sensmode`, `--matrix`→`--dmnd_matrix`,
+  `--gapopen`→`--dmnd_gapopen`, `--gapextend`→`--dmnd_gapextend`,
+  `--block_size`→`--dmnd_block_size`, `--index_chunks`→`--dmnd_index_chunks`.
+  `--dmnd_top` is unchanged.
+- **Annotation-stage thresholds renamed for clarity**:
+  `--seed_ortholog_evalue`→`--annot_evalue`,
+  `--seed_ortholog_score`→`--annot_score`. The search-stage `--evalue` /
+  `--score` (shared by diamond + mmseqs) are unchanged.
+
+### Added
+
+- **Seed sorting is the default** (and now the only mode for file-based seed
+  inputs): the `.seed_orthologs` entries are sorted by seed ortholog id before
+  annotation, so queries sharing a seed form contiguous blocks and each unique
+  seed is annotated once (its result fanned out to the duplicates). On full
+  UniProt this removes ~3× redundancy. The sort is atomic and reused on
+  `--resume`.
+- **The lazy closest-cascade is now on by default** (disable with
+  **`--no-lazy_cascade`**): a byte-identical tier-lazy annotation cascade for
+  `donor_pool=closest` (the default; automatically a no-op under `union`). A
+  per-protein field-presence mask (built once from `prots`, cached, and shared
+  across workers) lets the cascade select each field's winning donor bucket and
+  skip absent/sparse fields with zero ortholog fetches, then fetch only the
+  winning donors. Verified byte-identical by a fuzz + real-data parity test.
+- **`--annot_batch_size N`**: tune the number of seed orthologs annotated per
+  worker task (bulk-queried together); with sorted seeds (the default) the outer
+  batch is sized by distinct seeds so all workers stay fed on redundant inputs.
+- **`go-basic.obo` is now shipped by `download_eggnog_data.py`** and the active
+  GO mode is recorded in the output header as `go_namespace_split` — so a run
+  using the per-namespace (MF/BP/CC) cascade vs the legacy combined fallback is
+  reproducibly distinguishable from the file alone, not just a log line.
+- **The example-citation printed at the end of a run now includes the eggNOG DB
+  version used** (e.g. `eggNOG-mapper (version X; eggNOG DB version 7.0.0)`).
+- **Offline self-test dataset** (`test_datasets/`): a self-consistent subsample
+  of the final v7 mapper DB — nif-operon query seeds spanning Archaea and
+  Bacteria together with their full annotation-transfer closure
+  (`event_index` → `sp_events` → ortholog donors) — plus per-`--itype` query
+  fixtures (proteins, CDS, genome, metagenome) and golden outputs. A `pytest`
+  runner (`test_selftest.py`) exercises the whole option surface offline against
+  the mini DB, including auto-translate (CDS) and prodigal gene prediction
+  (genome/metagenome), and checks the nifH query recovers the `Fer4_NifH` OG.
+  The query input fixtures are committed; the subsampled DB and goldens ship as
+  a downloadable bundle (paired with the reference full DB, which can change),
+  rebuilt reproducibly by `make_test_dataset.py` + `gen_golden.py`.
+- **`emapper.py --selftest`**: one-command installation check. Downloads the
+  reference self-test bundle (from
+  `data.cgmlab.org/eggnog-mapper/emapper-<MAJOR.MINOR>/selftest/`, overridable via
+  `$EGGNOG_SELFTEST_URL`) and verifies the build reproduces the expected
+  annotations for every input type, exiting non-zero on any mismatch. Runs
+  inside emapper, so from the Apptainer image the bundled DIAMOND/prodigal are
+  used with no extra setup; `--data_dir` pointing at an already-downloaded
+  bundle skips the download.
+- **The lazy-cascade field-presence mask can now ship prebuilt** under a fixed
+  name `eggnog.db.fieldpresence.bin` (next to the DB), so a fresh install loads
+  it in seconds instead of paying the one-time full-`prots` scan (~50 min on the
+  59 M-protein DB) on first annotation. `load_field_presence` now reads in
+  preference order: explicit override → fixed shipped name → DB-fingerprinted
+  name → rebuild; it only ever *writes* the fingerprinted (self-invalidating)
+  name, never the shipped one. This mirrors the shipped taxid cache
+  (`eggnog.db.taxids.bin`): the fixed name survives download (it does not depend
+  on the DB mtime, unlike the fingerprint). `download_eggnog_data.py` fetches it
+  (optional), and a new maintainer tool `create_field_presence.py --data_dir`
+  generates it for a released DB. Maintainers rebuilding a DB in place must
+  delete the fixed-name file (it carries no self-invalidation).
+
 ### Changed
 
+- **Downloadable data is versioned by MAJOR.MINOR** on the server
+  (`data.cgmlab.org/eggnog-mapper/emapper-<MAJOR.MINOR>/`, e.g. `emapper-3.0/`).
+  MAJOR pins the eggNOG DB version (v3 → eggNOG 7); a MINOR bump (`3.0`→`3.1`)
+  signals a DB-structure / annotation-source change that requires re-downloading
+  data; PATCH releases (`3.0.x`) change emapper code only and reuse the same DBs
+  and self-test data. `download_eggnog_data.py --release` and `emapper.py
+  --selftest` now derive the folder from the running emapper's MAJOR.MINOR (new
+  `common.get_data_release()`), so all `3.0.x` builds share `emapper-3.0/`.
+  AppImages are hosted under the same folder.
+- **`*.emapper.annotations` TSV reduced from 25 to 22 columns.** Column set and
+  order change; all retained field values are byte-identical to prior output.
+  - Dropped `Description`: not needed — `Preferred_name` is retained and is the
+    useful human-readable gene label for e7.
+  - Dropped `max_annot_lvl`: in the e7-only build this is derivable as the
+    deepest `@taxid` node inside `eggNOG_OGs` and adds no new information.
+  - Dropped `farthest_donor_taxid`: this is exactly the last node of
+    `farthest_donor_lineage` — redundant.
+  - `tax_ceiling` and `farthest_donor_lineage` promoted into the context block
+    (positions 6 and 7, immediately after `eggNOG_OGs`).
+  - `COG_category` moved to position 8 (heads the functional-sources block).
+  - `annotation_confidence` moved to the last column (position 22).
+  - The internal 14-element `annotate_batch` tuple is unchanged; upstream
+    computation is untouched.
+  - The `--excel` row builder was brought into alignment with the new 22-column
+    header (fixes a pre-existing header/row-length mismatch).
+  - `--resume` across the schema boundary is now **detected and refused
+    loudly**: resuming an annotations file whose column count differs from the
+    current 22-column schema (e.g. an older 25-column partial run) aborts with a
+    clear `EmapperException` (previously the positional parser would misread
+    columns silently). Rerun with `--override` to regenerate.
+
+- **Column 22 `annotation_confidence` reformatted from verbose to compact.** The
+  field changed from `field=tier;...` (e.g.
+  `BRITE=high;EC=high;GOs=low;...` ~130 chars) to a fixed-width 13-character
+  positional string over the ANNOTATIONS_HEADER in order: one char per
+  functional-annotation column. Codes: `h`=high, `m`=medium, `l`=low,
+  `-`=not annotated. Codes are derived at runtime from TIER_CONFIDENCE, so any
+  future tier renaming propagates automatically. When `--no_file_comments` is
+  OFF, three new header `##` legend lines document the encoding. Downstream
+  parsers using split/regex on `;` and `=` must switch to positional decoding
+  via `zip(ANNOTATIONS_HEADER, s)`. All 21 other columns are byte-identical;
+  column count stays 22.
+
+- **Annotation throughput** on proteome/UniProt-scale runs is substantially
+  higher (≈90–300 → ≈800+ q/s on full UniProt) via seed-sorted global dedup,
+  distinct-seed batching, and the lazy cascade (all on by default) — all
+  producing byte-identical output.
 - **`--tax_scope` now accepts `auto` (default), `auto-broad`, or a fixed
   clade name/taxid** (e.g. `Metazoa`, `33208`). The old predefined scope
   list files (`bacteria`, `eukaryota`, `all_narrow`, etc.) are removed.
@@ -57,9 +202,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   non-empty tier.
 - **Output column `tax_scope_used` renamed to `tax_ceiling`** — reflects
   the resolved ceiling clade per seed (e.g. `Viridiplantae`).
-- **New output columns `farthest_donor_taxid` and `farthest_donor_lineage`**
-  — taxid and full lineage of the most distant donor used in annotation
-  transfer.
+- **New output column `farthest_donor_lineage`** — full semicolon-separated
+  lineage of the most evolutionarily distant donor ortholog used in the
+  annotation transfer. (A companion `farthest_donor_taxid` column was folded
+  out in the 22-column change above — it is exactly the last node of this
+  lineage.)
+- **`go-basic.obo` is resolved relative to `--data_dir`** (`$EGGNOG_GO_OBO` →
+  `<data_dir>/go-basic.obo` → `<data_dir>/e7/full/source/reference/go-basic.obo`)
+  instead of a hardcoded path, so shipping the OBO with the database works for
+  any data dir.
+- **Progress `q/s` is measured from the first produced result**, excluding the
+  one-time setup (DB load, worker fork, sort), so it reflects real annotation
+  throughput instead of being diluted by startup.
+- **CI migrated from Travis to GitHub Actions** (Python 3.9–3.11); the
+  `biopython` floor in `requirements.txt` was raised to `>=1.79` to match
+  `setup.cfg`. The README no longer directs production users to install v2.
+
+### Fixed
+
+- **Malformed `--annotate_hits_table` lines** now raise a clear error naming
+  the file/line/content, instead of silently re-emitting the previous line's
+  hit (which misattributed its annotation) or raising `UnboundLocalError`.
+- **`--resume` in report-orthologs mode** matched on the first *character* of
+  each line rather than the query column, so the resume lockstep never matched:
+  every query was re-annotated and every ortholog row was duplicated (append
+  mode). It now matches on the query column.
+- **Stale binary caches after an in-place DB rebuild**: the `taxid` array and
+  the lazy-cascade field-presence caches were validated by protein count only,
+  so a rebuild that kept the same count could silently reuse a stale cache
+  (wrong taxonomy / dropped or misplaced annotation fields). Both are now keyed
+  on a DB size+mtime fingerprint; an archived older DB keeps its own cache.
+
+---
+
+## [3.0.0-beta4] — 2026-07-31
+
+### Added
+
+- **`--resume` skips seed_orthologs regeneration when the file is complete**:
+  on resume, if `.seed_orthologs` is already fully written (detected via the
+  `## N queries scanned` footer sentinel), both the DIAMOND/MMseqs2 search and
+  the seed-writing/`.hits` re-parse are skipped and annotation reads the
+  existing file directly. Incomplete or unmarked files (e.g. written with
+  `--no_file_comments`) fall back to full regeneration, so the check can never
+  reuse a truncated file. Proteins/CDS only — genome/meta still regenerate
+  because the seed pass also yields the contig-relative hits used downstream
+  for GFF/FASTA.
+
+### Fixed
+
+- **Search/annotation pipeline decoupling**: the `.seed_orthologs` file is now
+  written completely before the annotation phase begins. Previously,
+  `output_seeds` was a lazy generator that wrote to the file as the annotation
+  workers consumed hits, leaving the file incomplete until the full run
+  finished. The file is now generated in a single sequential pass immediately
+  after the search tool (DIAMOND or MMseqs2) exits.
+- **Annotation crash on large runs (`KeyError` from OG-info cache)**: on runs
+  with more than ~100k unique orthologous groups, the OG-description cache
+  evicted its oldest half *before* the current lookup had read its results,
+  so a group carried over from an earlier batch could be dropped while still
+  needed — aborting the whole run mid-way (observed at ~5.5M queries). The
+  result is now read before eviction. This also closes a latent correctness
+  gap where an evicted-but-needed group would have silently lost its
+  description and COG category.
+
+### Changed
+
+- **Compressed input is now streamed, not pre-decompressed**: gzipped query
+  files are passed straight to DIAMOND/MMseqs2 (both read `.gz` natively) and
+  to the FASTA iterators, instead of first inflating the whole file to a temp
+  copy on disk. This removes the full on-disk decompression step for large
+  gzipped inputs (e.g. UniProt). bzip2 is still decompressed (no search tool
+  streams it), and Prodigal now detects compression by magic bytes rather than
+  the `.gz` extension. Annotations are identical to plain-input runs.
 
 ---
 
@@ -176,7 +391,7 @@ pip install --upgrade eggnog-mapper   # or: pip install eggnog-mapper==3.0.0b2
 download_eggnog_data.py --data_dir /path/to/eggnog-data
 
 # 4. Run
-emapper.py --version  # should print 3.0.0-beta2
+emapper.py --version  # should print 3.0.0-beta3
 emapper.py -m diamond -i proteins.fa --itype proteins \
     --data_dir /path/to/eggnog-data -o out --output_dir results/ --cpu 20
 ```

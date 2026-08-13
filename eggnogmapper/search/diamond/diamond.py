@@ -9,12 +9,13 @@ from sys import stderr as sys_stderr
 from tempfile import mkdtemp, mkstemp
 
 from ...emapperException import EmapperException
-from ...common import DIAMOND, ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META
+from ...common import DIAMOND, ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META, \
+    resolve_input_for_tool, gz_uncompressed_size, silent_rm
 from ...utils import colorify, translate_cds_to_prots
 
 from ..hmmer.hmmer_seqio import iter_fasta_seqs
 
-from ..hits_io import output_seeds
+from ..hits_io import output_seeds, seed_orthologs_complete
 
 SENSMODE_FAST = "fast"
 SENSMODE_DEFAULT = "default"
@@ -112,11 +113,10 @@ def _auto_dmnd_resources(block_size, index_chunks, algo,
 
     # ---- algo: input-size driven ----
     if algo == DMND_ALGO_AUTO and query_path is not None:
-        try:
-            import os as _os
-            qsize_bytes = _os.path.getsize(query_path)
-        except OSError:
-            qsize_bytes = None
+        # gz_uncompressed_size sees through a gzipped query (via the ISIZE
+        # trailer) so a small compressed file isn't mistaken for a small
+        # input when diamond will actually stream a large decompressed one.
+        qsize_bytes = gz_uncompressed_size(query_path)
         # Heuristic: query-indexed (algo=1) wins when the input is small
         # enough that diamond's startup index-load dominates total wall.
         # ~5 MB FASTA ≈ 12k average proteins (300 aa each); below that,
@@ -141,7 +141,6 @@ class DiamondSearcher:
 
     in_file = None
     itype = None
-    translate = None
     query_gencode = None
 
     allow_overlaps = None
@@ -153,7 +152,6 @@ class DiamondSearcher:
     def __init__(self, args, dmnd_db):
         
         self.itype = args.itype
-        self.translate = args.translate
         self.query_gencode = args.trans_table
 
         self.allow_overlaps = args.allow_overlaps
@@ -163,7 +161,7 @@ class DiamondSearcher:
 
         self.cpu = args.cpu
 
-        self.sensmode = args.sensmode
+        self.sensmode = args.dmnd_sensmode
         self.iterate = args.dmnd_iterate
         self.ignore_warnings = args.dmnd_ignore_warnings
         # `self.algo` is overwritten in the search command builder once
@@ -175,10 +173,10 @@ class DiamondSearcher:
         self.query_cov = args.query_cover
         self.subject_cov = args.subject_cover
 
-        self.matrix = args.matrix
+        self.matrix = args.dmnd_matrix
         self.frameshift = args.dmnd_frameshift
-        self.gapopen = args.gapopen
-        self.gapextend = args.gapextend
+        self.gapopen = args.dmnd_gapopen
+        self.gapextend = args.dmnd_gapextend
         # Auto-tune at __init__ runs only RAM-driven decisions
         # (block_size, index_chunks). The algo decision is deferred to
         # search-time because it depends on the query file size which
@@ -229,7 +227,20 @@ class DiamondSearcher:
         
         try:
             cmds = None
-            
+
+            # 0) On resume, if the parsed seeds file is already complete, reuse
+            # it directly and skip both the DIAMOND search and the seed-writing
+            # pass (which would otherwise re-parse the whole .hits file).
+            # Limited to proteins/CDS: for genome/meta the seed-writing pass
+            # also returns the contig-relative orig_hits consumed downstream for
+            # GFF/FASTA creation, which cannot be reconstructed from the file.
+            if (self.resume == True
+                    and (self.itype == ITYPE_CDS or self.itype == ITYPE_PROTS)
+                    and seed_orthologs_complete(seed_orthologs_file)):
+                print(f"[resume] Skipping seed_orthologs generation — reusing complete file: {seed_orthologs_file}",
+                      file=sys_stderr)
+                return None  # annotation reads from the completed seeds file
+
             # 1) either resume from previous hits or run diamond to generate the hits
             if self.resume == True:
                 if pisfile(hits_file):
@@ -248,17 +259,25 @@ class DiamondSearcher:
                 hits_generator = self._parse_genepred(hits_file)
 
                 
-            # 3) output seeds
+            # 3) output seeds (eager: full file written before annotation starts)
             if self.itype == ITYPE_CDS or self.itype == ITYPE_PROTS:
                 change_seeds_coords = False
             else: #self.itype == ITYPE_GENOME or self.itype == ITYPE_META:
-                # change seeds coordinates relative to the ORF, not to the contig (to use them for the .seed_orthologs file)
+                # ORF-relative coords go to the seeds file; contig-relative
+                # coords are returned for downstream GFF/FASTA creation.
                 change_seeds_coords = True
-                
-            hits_generator = output_seeds(cmds, hits_generator,
-                                          seed_orthologs_file,
-                                          self.no_file_comments,
-                                          change_seeds_coords)
+
+            orig_hits = output_seeds(cmds, hits_generator,
+                                     seed_orthologs_file,
+                                     self.no_file_comments,
+                                     change_seeds_coords)
+
+            if self.itype == ITYPE_CDS or self.itype == ITYPE_PROTS:
+                # Annotation will read from the completed seed_orthologs file.
+                hits_generator = None
+            else:
+                # Blastx/genepred: pass contig-relative hits on to GFF/FASTA.
+                hits_generator = iter(orig_hits)
 
         except Exception as e:
             raise e
@@ -270,18 +289,23 @@ class DiamondSearcher:
         cmds = []
 
         handle = None
+        tmp_query = None
         ##
         # search type
-        if self.itype == ITYPE_CDS and self.translate == True:
+        if self.itype == ITYPE_CDS:
+            # CDS always translated to proteins before search (blastp path)
             tool = 'blastp'
             handle, query_file = mkstemp(dir = self.temp_dir, text = True)
             translate_cds_to_prots(fasta_file, query_file, self.query_gencode)
-        elif self.itype == ITYPE_CDS or self.itype == ITYPE_GENOME or self.itype == ITYPE_META:
+        elif self.itype == ITYPE_GENOME or self.itype == ITYPE_META:
             tool = 'blastx'
-            query_file = fasta_file
+            # diamond streams gzipped queries natively; bzip2 is decompressed.
+            query_file, tmp_query = resolve_input_for_tool(
+                fasta_file, self.temp_dir, streams_gzip=True)
         elif self.itype == ITYPE_PROTS:
             tool = 'blastp'
-            query_file = fasta_file
+            query_file, tmp_query = resolve_input_for_tool(
+                fasta_file, self.temp_dir, streams_gzip=True)
         else:
             raise EmapperException(f"Unrecognized --itype {self.itype}.")
 
@@ -357,7 +381,9 @@ class DiamondSearcher:
         finally:
             if handle is not None:
                 os.close(handle)
-        
+            if tmp_query is not None:
+                silent_rm(tmp_query)
+
         return cmds
         
     ##

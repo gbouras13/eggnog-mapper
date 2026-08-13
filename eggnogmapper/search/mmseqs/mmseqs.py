@@ -10,13 +10,14 @@ from tempfile import mkdtemp, mkstemp
 import uuid
 
 from ...common import MMSEQS2, resolve_mmseqs_db, \
-    ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META
+    ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META, \
+    resolve_input_for_tool, silent_rm
 from ...emapperException import EmapperException
 from ...utils import colorify, translate_cds_to_prots
 
 from ..hmmer.hmmer_seqio import iter_fasta_seqs
 
-from ..hits_io import output_seeds
+from ..hits_io import output_seeds, seed_orthologs_complete
 from ..diamond.diamond import hit_does_overlap, ALLOW_OVERLAPS_ALL
 
 def create_mmseqs_db(dbprefix, in_fasta):
@@ -62,7 +63,6 @@ class MMseqs2Searcher:
 
     in_file = None
     itype = None
-    translate = None
     translation_table = None
 
     allow_overlaps = None
@@ -74,7 +74,6 @@ class MMseqs2Searcher:
     def __init__(self, args):
 
         self.itype = args.itype
-        self.translate = args.translate
         self.translation_table = args.trans_table
 
         self.allow_overlaps = args.allow_overlaps
@@ -131,6 +130,16 @@ class MMseqs2Searcher:
         try:
             cmds = None
 
+            # 0) On resume, if the parsed seeds file is already complete, reuse
+            # it directly and skip both the MMseqs2 search and the seed-writing
+            # pass. Limited to proteins/CDS (see diamond.py for rationale).
+            if (self.resume == True
+                    and (self.itype == ITYPE_CDS or self.itype == ITYPE_PROTS)
+                    and seed_orthologs_complete(seed_orthologs_file)):
+                print(f"[resume] Skipping seed_orthologs generation — reusing complete file: {seed_orthologs_file}",
+                      file=sys_stderr)
+                return None  # annotation reads from the completed seeds file
+
             # 1) either resume from previous hits or run mmseqs to generate the hits
             if self.resume == True:
                 if pisfile(hits_file):
@@ -159,17 +168,25 @@ class MMseqs2Searcher:
                 hits_generator = self._parse_genepred(hits_file)
 
 
-            # 3) output seeds
+            # 3) output seeds (eager: full file written before annotation starts)
             if self.itype == ITYPE_CDS or self.itype == ITYPE_PROTS:
                 change_seeds_coords = False
             else: #self.itype == ITYPE_GENOME or self.itype == ITYPE_META:
-                # change seeds coordinates relative to the ORF, not to the contig (to use them for the .seed_orthologs file)
+                # ORF-relative coords go to the seeds file; contig-relative
+                # coords are returned for downstream GFF/FASTA creation.
                 change_seeds_coords = True
-                
-            hits_generator = output_seeds(cmds, hits_generator,
-                                          seed_orthologs_file,
-                                          self.no_file_comments,
-                                          change_seeds_coords)
+
+            orig_hits = output_seeds(cmds, hits_generator,
+                                     seed_orthologs_file,
+                                     self.no_file_comments,
+                                     change_seeds_coords)
+
+            if self.itype == ITYPE_CDS or self.itype == ITYPE_PROTS:
+                # Annotation will read from the completed seed_orthologs file.
+                hits_generator = None
+            else:
+                # Blastx/genepred: pass contig-relative hits on to GFF/FASTA.
+                hits_generator = iter(orig_hits)
 
         except Exception as e:
             raise e
@@ -181,12 +198,17 @@ class MMseqs2Searcher:
         cmds = []
 
         handle = None
+        tmp_query = None
         try:
-            if self.itype == ITYPE_CDS and self.translate == True:
+            if self.itype == ITYPE_CDS:
+                # CDS always translated to proteins before search (protein dbtype path)
                 handle, query_file = mkstemp(dir = self.temp_dir, text = True)
                 translate_cds_to_prots(fasta_file, query_file, self.translation_table)
             else:
-                query_file = fasta_file
+                # mmseqs createdb reads gzipped input natively; bzip2 is
+                # decompressed to a temp file first.
+                query_file, tmp_query = resolve_input_for_tool(
+                    fasta_file, self.temp_dir, streams_gzip=True)
 
             cmd = self.createdb(query_file, querydb)
             cmds.append(cmd)
@@ -205,6 +227,8 @@ class MMseqs2Searcher:
         finally:
             if handle is not None:
                 os.close(handle)
+            if tmp_query is not None:
+                silent_rm(tmp_query)
 
         return bestresultdb, cmds
 
@@ -213,10 +237,11 @@ class MMseqs2Searcher:
         cmd = (
             f'{MMSEQS2} createdb \'{fasta_file}\' \'{querydb}\''
         )
-        if self.itype == ITYPE_PROTS or (self.itype == ITYPE_CDS and self.translate == True):
+        if self.itype == ITYPE_PROTS or self.itype == ITYPE_CDS:
+            # CDS is always pre-translated to proteins; use protein dbtype
             cmd += ' --dbtype 1' # aas queries (proteins)
         else:
-            cmd += ' --dbtype 2' # nts queries (CDS, contig, ...)
+            cmd += ' --dbtype 2' # nts queries (genome, metagenome contigs)
             
         print(colorify('  '+cmd, 'yellow'))
         try:

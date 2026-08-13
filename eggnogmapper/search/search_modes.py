@@ -6,7 +6,6 @@ from os.path import join as pjoin
 from ..emapperException import EmapperException
 
 from .diamond.diamond import DiamondSearcher
-from .hmmer.hmmer import HmmerSearcher
 from .mmseqs.mmseqs import MMseqs2Searcher
 # NOTE: FoldseekSearcher is imported lazily in get_searcher(). It pulls in
 # torch/transformers for 3Di inference, which we do not want to make a hard
@@ -14,7 +13,6 @@ from .mmseqs.mmseqs import MMseqs2Searcher
 
 SEARCH_MODE_NO_SEARCH = "no_search"
 SEARCH_MODE_DIAMOND = "diamond"
-SEARCH_MODE_HMMER = "hmmer"
 SEARCH_MODE_MMSEQS2 = "mmseqs"
 SEARCH_MODE_FOLDSEEK = "foldseek"
 # Two-stage modes: run the sequence searcher first, then Foldseek over the
@@ -25,7 +23,6 @@ SEARCH_MODE_MMSEQS2_FOLDSEEK = "mmseqs-foldseek"
 ALL_SEARCH_MODES = (
     SEARCH_MODE_NO_SEARCH,
     SEARCH_MODE_DIAMOND,
-    SEARCH_MODE_HMMER,
     SEARCH_MODE_MMSEQS2,
     SEARCH_MODE_FOLDSEEK,
     SEARCH_MODE_DIAMOND_FOLDSEEK,
@@ -46,8 +43,6 @@ def get_searcher(args, mode, data_path):
         return None
     if mode in DIAMOND_MODES:
         return DiamondSearcher(args, get_eggnog_dmnd_db(args.dmnd_db, mode, data_path))
-    if mode == SEARCH_MODE_HMMER:
-        return HmmerSearcher(args)
     if mode in MMSEQS_MODES:
         return MMseqs2Searcher(args)
     if mode == SEARCH_MODE_FOLDSEEK:

@@ -8,7 +8,7 @@ from os.path import exists as pexists
 from os.path import join as pjoin
 
 from .utils import colorify
-from .common import silent_rm, decompress_input, detect_compression, \
+from .common import silent_rm, sort_seeds_file, \
     ITYPE_GENOME, ITYPE_META, ITYPE_PROTS, ITYPE_CDS, get_data_path
 from .emapperException import EmapperException
 
@@ -182,7 +182,6 @@ class Emapper:
             queries_file = infile
         else:
             queries_file = predictor.outprots
-            args.translate = False
             args.itype = ITYPE_PROTS
 
         # search
@@ -212,12 +211,9 @@ class Emapper:
                 print(colorify("Crafting fasta file of CDS ...", "lgreen"))
                 fasta_file = pjoin(self._current_dir, self.genepred_fasta_file)
                 silent_rm(fasta_file)
-                hits = create_prots_file(queries_file, hits, fasta_file, args.translate, args.trans_table)
+                hits = create_prots_file(queries_file, hits, fasta_file, False, args.trans_table)
                 queries_file = fasta_file
-                if args.translate == True:
-                    args.itype = ITYPE_PROTS
-                else:
-                    args.itype = ITYPE_CDS
+                args.itype = ITYPE_CDS
                 
         return searcher, searcher_name, hits, queries_file
     
@@ -230,17 +226,49 @@ class Emapper:
         if self.annot == True or self.report_orthologs:
             annot_in = None  # a generator of hits to annotate
 
+            # File-based seed inputs are always sorted by seed ortholog id
+            # so shared seeds form contiguous blocks and each unique seed is
+            # annotated once (see AnnotationEngine.annotate_batch dedup). Only
+            # applies to file inputs; the in-memory blastx path is left as-is.
+            def _sorted_seed_input(path):
+                sorted_path = path + ".sorted"
+                # On --resume, reuse an existing sorted file instead of
+                # re-sorting the whole (potentially huge) input. It is written
+                # atomically, so its presence means a previous sort completed;
+                # require it to be at least as new as the source so a
+                # regenerated seed file invalidates a stale sort.
+                if (self.resume
+                        and pexists(sorted_path)
+                        and os.path.getmtime(sorted_path) >= os.path.getmtime(path)):
+                    print(colorify(
+                        f"[resume] Reusing sorted seed orthologs: {sorted_path}",
+                        "blue"), file=stderr)
+                    return sorted_path
+                print(colorify(
+                    f"Sorting {path} by seed ortholog id...",
+                    "blue"), file=stderr)
+                sort_seeds_file(path, sorted_path,
+                                temp_dir=args.temp_dir, parallel=args.cpu)
+                return sorted_path
+
             if annotate_hits_table is not None:
                 if not pexists(annotate_hits_table):
                     raise EmapperException(
                         f"Could not find the file with the hits "
                         f"table to annotate: {annotate_hits_table}"
                     )
-                annot_in = parse_seeds(annotate_hits_table)
+                annot_in = parse_seeds(_sorted_seed_input(annotate_hits_table))
             elif hits is not None:
                 annot_in = hits
             else:
-                raise EmapperException("Could not find hits to annotate.")
+                # Search wrote seed_orthologs eagerly; read from the
+                # completed file so annotation is fully decoupled from search.
+                seed_file = pjoin(self._current_dir, self.seed_orthologs_file)
+                if not pexists(seed_file):
+                    raise EmapperException(
+                        f"No hits to annotate and seed orthologs file not found: {seed_file}"
+                    )
+                annot_in = parse_seeds(_sorted_seed_input(seed_file))
 
             annotator = Annotator(args, self.annot, self.excel, self.report_orthologs)
 
@@ -328,13 +356,19 @@ class Emapper:
         return no_hit_fasta
 
     ##
-    def _print_progress(self, n, n_new, start_time, mem_monitor):
-        total_time = time.time() - start_time
+    def _print_progress(self, n, n_new, start_time, proc_start, mem_monitor):
+        now = time.time()
+        total_time = now - start_time
         percen_mem = psutil.virtual_memory().percent
         percen_avail = psutil.virtual_memory().available * 100 / psutil.virtual_memory().total
 
         if total_time > 0.005:
-            rate = (float(n_new) / total_time) if total_time > 0 else 0.0
+            # Measure the rate from the first produced result (proc_start), not
+            # from process start, so the one-time setup (DB load, worker fork,
+            # --sort_entries sort) is excluded and the number reflects actual
+            # annotation throughput instead of being diluted by startup.
+            proc_time = (now - proc_start) if proc_start is not None else total_time
+            rate = (float(n_new) / proc_time) if proc_time > 0 else 0.0
             n_resumed = n - n_new
             if n_resumed:
                 msg = f"{n} ({n_new} new, {n_resumed} resumed) {total_time:.1f}s {rate:.2f} q/s"
@@ -371,21 +405,31 @@ class Emapper:
 
         n = 0
         start_time = time.time()
+        proc_start = None
 
         _n_skipped = resumed_ref if resumed_ref is not None else [0]
 
-        self._print_progress(0, 0, start_time, mem_monitor)
+        self._print_progress(0, 0, start_time, proc_start, mem_monitor)
 
         for item in generator:
+            if proc_start is None:
+                # First result: all one-time setup (DB load, worker fork,
+                # --sort_entries sort) is done. Anchor the throughput clock here
+                # so the reported q/s reflects annotation speed, not startup.
+                proc_start = time.time()
+                print(colorify(
+                    f"[annotation] setup completed in {proc_start - start_time:.1f}s; "
+                    "q/s below is measured from here (excludes setup).",
+                    "blue"), file=stderr)
             n += 1
             if collect_ids is not None:
                 collect_ids.add(self._item_query_name(item))
             if n % CHUNK_SIZE == 0:
                 n_new = n - _n_skipped[0]
-                self._print_progress(n, n_new, start_time, mem_monitor)
+                self._print_progress(n, n_new, start_time, proc_start, mem_monitor)
 
         n_new = n - _n_skipped[0]
-        total_time = self._print_progress(n, n_new, start_time, mem_monitor)
+        total_time = self._print_progress(n, n_new, start_time, proc_start, mem_monitor)
 
         return n, total_time
 
@@ -426,82 +470,74 @@ class Emapper:
     ##
     def run(self, args, infile, annotate_hits_table=None):
 
-        _tmp_infile = None
-        try:
-            ##
-            # Decompress compressed input transparently (gzip or bzip2, by magic bytes)
-            if infile is not None:
-                ctype = detect_compression(infile)
-                if ctype:
-                    print(colorify(
-                        f"Detected {ctype} compressed input — decompressing to temp file...",
-                        'blue'), file=stderr)
-                    infile, _tmp_infile = decompress_input(infile, args.temp_dir)
+        ##
+        # Compressed input (gzip/bzip2, detected by magic bytes) is NOT
+        # eagerly inflated to a temp file here. Each consumer handles it at
+        # the point of use: the FASTA iterators (iter_fasta_seqs/gopen) read
+        # gz+bz2 transparently, and the search tools stream gzip natively
+        # (decompressing only bzip2). This avoids materialising the whole
+        # decompressed input on disk for large gzipped FASTAs.
 
-            ##
-            # Step 0. Gene prediction
-            predictor = self.gene_prediction(args, infile)
+        ##
+        # Step 0. Gene prediction
+        predictor = self.gene_prediction(args, infile)
 
-            ##
-            # Step 1. Sequence search
-            searcher, searcher_name, hits, queries_file = self.search(args, infile, predictor)
+        ##
+        # Step 1. Sequence search
+        searcher, searcher_name, hits, queries_file = self.search(args, infile, predictor)
 
-            ##
-            # Step 2. Annotation
-            annotated_hits, _resumed_ref = self.annotate(args, hits, annotate_hits_table, queries_file)
+        ##
+        # Step 2. Annotation
+        annotated_hits, _resumed_ref = self.annotate(args, hits, annotate_hits_table, queries_file)
 
-            ##
+        ##
+        # Step 3. Decorate GFF
+        annotated_hits = self.decorate_gff_f(args, predictor, searcher_name, annotated_hits)
+
+        ##
+        # Run the generators
+        annotated_ids = set() if self.is_two_stage_foldseek else None
+        n, elapsed_time = self.run_generator(annotated_hits, _resumed_ref,
+                                             collect_ids=annotated_ids)
+
+        ##
+        # Two-stage *-foldseek modes: re-run steps 1-3 with Foldseek over
+        # the queries the first pass left unannotated.
+        if self.is_two_stage_foldseek:
+            # the first-pass searcher is done with; release its temp dir
+            # before wrap_up() only ever sees the Foldseek one
+            if searcher is not None:
+                searcher.clear()
+                searcher = None
+
+            self._switch_to_foldseek_stage()
+            foldseek_infile = self.filter_infile(infile, annotated_ids)
+
+            # Step 1. Sequence search. No predictor: search() would use
+            # predictor.outprots and ignore our filtered FASTA. Gene
+            # prediction already ran in the first pass, and the filtered
+            # FASTA holds the predicted proteins that stayed unannotated.
+            searcher, searcher_name, hits, queries_file = self.search(
+                args, foldseek_infile, None)
+
+            # Step 2. Annotation. annotate_hits_table is deliberately not
+            # reused: it belongs to the first pass, and re-reading it here
+            # would annotate the whole table a second time.
+            annotated_hits, _resumed_ref = self.annotate(
+                args, hits, None, queries_file)
+
             # Step 3. Decorate GFF
-            annotated_hits = self.decorate_gff_f(args, predictor, searcher_name, annotated_hits)
+            annotated_hits = self.decorate_gff_f(args, predictor, searcher_name,
+                                                 annotated_hits)
 
-            ##
-            # Run the generators
-            annotated_ids = set() if self.is_two_stage_foldseek else None
-            n, elapsed_time = self.run_generator(annotated_hits, _resumed_ref,
-                                                 collect_ids=annotated_ids)
+            # Run the generators. elapsed_time is deliberately not summed:
+            # the caller reports wall-clock time for the whole run.
+            n_foldseek, _ = self.run_generator(annotated_hits, _resumed_ref)
+            n += n_foldseek
 
-            ##
-            # Two-stage *-foldseek modes: re-run steps 1-3 with Foldseek over
-            # the queries the first pass left unannotated.
-            if self.is_two_stage_foldseek:
-                # the first-pass searcher is done with; release its temp dir
-                # before wrap_up() only ever sees the Foldseek one
-                if searcher is not None:
-                    searcher.clear()
-                    searcher = None
-
-                self._switch_to_foldseek_stage()
-                foldseek_infile = self.filter_infile(infile, annotated_ids)
-
-                # Step 1. Sequence search. No predictor: search() would use
-                # predictor.outprots and ignore our filtered FASTA. Gene
-                # prediction already ran in the first pass, and the filtered
-                # FASTA holds the predicted proteins that stayed unannotated.
-                searcher, searcher_name, hits, queries_file = self.search(
-                    args, foldseek_infile, None)
-
-                # Step 2. Annotation. annotate_hits_table is deliberately not
-                # reused: it belongs to the first pass, and re-reading it here
-                # would annotate the whole table a second time.
-                annotated_hits, _resumed_ref = self.annotate(
-                    args, hits, None, queries_file)
-
-                # Step 3. Decorate GFF
-                annotated_hits = self.decorate_gff_f(args, predictor, searcher_name,
-                                                     annotated_hits)
-
-                # Run the generators. elapsed_time is deliberately not summed:
-                # the caller reports wall-clock time for the whole run.
-                n_foldseek, _ = self.run_generator(annotated_hits, _resumed_ref)
-                n += n_foldseek
-
-            ##
-            # Finish
-            self.wrap_up(predictor, searcher)
-
-        finally:
-            if _tmp_infile is not None:
-                silent_rm(_tmp_infile)
+        ##
+        # Finish
+        self.wrap_up(predictor, searcher)
 
         return n, elapsed_time
 

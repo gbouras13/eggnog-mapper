@@ -13,9 +13,22 @@ domains, EC numbers, and more — from known orthologs.
 ### 1. Install databases
 
 ```bash
-# Download the default eggNOG 5 databases (annotation DB + DIAMOND DB + taxonomy DB)
+# Download the default eggNOG 7 databases (annotation DB + DIAMOND DB + taxonomy DB)
 python download_eggnog_data.py -y
 ```
+
+Data is versioned by **MAJOR.MINOR** on the server
+(`data.cgmlab.org/eggnog-mapper/emapper-<MAJOR.MINOR>/`, e.g. `emapper-3.0/`):
+
+- **MAJOR** pins the eggNOG DB version — the **v3** series uses **eggNOG 7**.
+- A **MINOR** bump (`3.0` → `3.1`) means the DB structure or annotation sources
+  changed, so the databases must be re-downloaded.
+- **PATCH** releases (`3.0.0` → `3.0.1`) change emapper code only; the whole
+  `3.0.x` series reuses the same databases and self-test data.
+
+`download_eggnog_data.py` derives the folder from this emapper's MAJOR.MINOR
+automatically (override with `--release 3.0`). Downloadable AppImages live under
+the same `emapper-<MAJOR.MINOR>/` folder.
 
 ### 2. Annotate protein sequences
 
@@ -705,7 +718,7 @@ python create_dbs.py -y --dbname my_custom --taxids 2,2157 -m mmseqs
 
 ## Annotation Output Columns
 
-The `*.emapper.annotations` file is a TSV with the following columns:
+The `*.emapper.annotations` file is a TSV with the following 22 columns:
 
 | # | Column | Description |
 |---|--------|-------------|
@@ -713,10 +726,10 @@ The `*.emapper.annotations` file is a TSV with the following columns:
 | 2 | `seed_ortholog` | Best matching eggNOG protein |
 | 3 | `evalue` | E-value of the seed ortholog hit |
 | 4 | `score` | Bit score of the seed ortholog hit |
-| 5 | `eggNOG_OGs` | Orthologous groups at different taxonomic levels |
-| 6 | `max_annot_lvl` | Broadest taxonomic level used for annotation |
-| 7 | `COG_category` | COG functional category letter(s) |
-| 8 | `Description` | Functional description from the best OG |
+| 5 | `eggNOG_OGs` | Orthologous groups at different taxonomic levels (comma-separated `OG@taxid|level`) |
+| 6 | `tax_ceiling` | Resolved taxonomic ceiling clade name for this seed |
+| 7 | `farthest_donor_lineage` | Lineage of the most distant donor ortholog used (semicolon-separated, root to leaf) |
+| 8 | `COG_category` | COG functional category letter(s) |
 | 9 | `Preferred_name` | Short gene name |
 | 10 | `GOs` | Gene Ontology terms (comma-separated) |
 | 11 | `EC` | Enzyme Commission numbers |
@@ -730,7 +743,69 @@ The `*.emapper.annotations` file is a TSV with the following columns:
 | 19 | `CAZy` | Carbohydrate-Active Enzymes |
 | 20 | `BiGG_Reaction` | BiGG metabolic reactions |
 | 21 | `PFAMs` | Pfam domain identifiers |
-| 22 | `annotation_confidence` | Confidence per field: `field=tier;...` (high/medium/low) |
-| 23 | `tax_ceiling` | Resolved taxonomic ceiling clade name for this seed |
-| 24 | `farthest_donor_taxid` | Taxid of most distant donor ortholog used |
-| 25 | `farthest_donor_lineage` | Lineage of that donor (semicolon-separated, root→leaf) |
+| 22 | `annotation_confidence` | Fixed-width positional string (13 chars). One char per functional-annotation column in ANNOTATIONS_HEADER order. Codes: `h`=high, `m`=medium, `l`=low, `-`=not annotated. See "annotation_confidence encoding" below. |
+
+---
+
+### annotation_confidence encoding
+
+Column 22 uses a compact positional encoding where each character represents the
+confidence tier of one functional-annotation field, in the fixed order:
+`Preferred_name GOs EC KEGG_ko KEGG_Pathway KEGG_Module KEGG_Reaction KEGG_rclass BRITE KEGG_TC CAZy BiGG_Reaction PFAMs`
+
+**Confidence codes:**
+- `h` = high (1:1 ortholog or seed's own curated annotation)
+- `m` = medium (1:many or many:1 ortholog)
+- `l` = low (many:many ortholog)
+- `-` = field not annotated
+
+Codes are derived at runtime from `TIER_CONFIDENCE`, so future tier renaming
+propagates automatically without format changes.
+
+**When header legend is printed:**
+When `--no_file_comments` is OFF (default), three `##` comment lines in the
+output file document this encoding:
+```
+## annotation_confidence: one char per annotation field
+## confidence codes: h=high m=medium l=low -=not annotated
+## confidence field order: Preferred_name GOs EC KEGG_ko KEGG_Pathway KEGG_Module KEGG_Reaction KEGG_rclass BRITE KEGG_TC CAZy BiGG_Reaction PFAMs
+```
+
+Users who pass `--no_file_comments` should reference this section to decode the
+string.
+
+**Decoding example:**
+
+Fields and codes:
+```python
+ANNOTATIONS_HEADER = [
+    "Preferred_name", "GOs", "EC", "KEGG_ko", "KEGG_Pathway",
+    "KEGG_Module", "KEGG_Reaction", "KEGG_rclass", "BRITE",
+    "KEGG_TC", "CAZy", "BiGG_Reaction", "PFAMs"
+]
+
+confidence_codes = {"h": "high", "m": "medium", "l": "low"}
+
+def decode_confidence(s):
+    """Decode a 13-char confidence string into a dict."""
+    return {
+        field: confidence_codes[code]
+        for field, code in zip(ANNOTATIONS_HEADER, s)
+        if code != "-"
+    }
+```
+
+For a row with `annotation_confidence = "hlhhhh--h---h"`:
+- Position 0 (Preferred_name): `h` (high)
+- Position 1 (GOs): `l` (low)
+- Position 2 (EC): `h` (high)
+- Position 3 (KEGG_ko): `h` (high)
+- Position 4 (KEGG_Pathway): `h` (high)
+- Position 5 (KEGG_Module): `h` (high)
+- Position 6 (KEGG_Reaction): `-` (not annotated)
+- Position 7 (KEGG_rclass): `-` (not annotated)
+- Position 8 (BRITE): `h` (high)
+- Positions 9–12: `-` (not annotated)
+- Position 12 (PFAMs): `h` (high)
+
+Result: `{Preferred_name: high, GOs: low, EC: high, KEGG_ko: high, KEGG_Pathway: high, KEGG_Module: high, BRITE: high, PFAMs: high}`

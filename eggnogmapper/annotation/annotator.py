@@ -31,7 +31,7 @@ class Annotator:
     # options for pfam hmmpgmd searches
     num_servers = num_workers = timeout_load_server = cpus_per_worker = port = end_port = None
 
-    seed_ortholog_score = seed_ortholog_evalue = None
+    annot_score = annot_evalue = None
     target_taxa = target_orthologs = excluded_taxa = None
 
     pfam_realign = trans_table = temp_dir = None
@@ -61,14 +61,19 @@ class Annotator:
         self.cpus_per_worker = args.cpus_per_worker
         self.port = args.port
         self.end_port = args.end_port
-        self.seed_ortholog_score = args.seed_ortholog_score
-        self.seed_ortholog_evalue = args.seed_ortholog_evalue
+        self.annot_score = args.annot_score
+        self.annot_evalue = args.annot_evalue
 
         # --tax_scope: "auto" | "auto-broad" | <clade_name_or_taxid>
         self.tax_scope = args.tax_scope
 
         # --donor_pool: "closest" | "union"
         self.donor_pool = getattr(args, "donor_pool", "closest") or "closest"
+
+        # --lazy_cascade: tier-staged lazy cascade for closest donor_pool.
+        # Byte-identical output; fetches only the orthologs the cascade
+        # consumes. No effect under donor_pool="union".
+        self.lazy_cascade = bool(getattr(args, "lazy_cascade", False))
 
         self.target_taxa = args.target_taxa
         self.target_orthologs = args.target_orthologs
@@ -87,9 +92,25 @@ class Annotator:
         # dropped_file and writes one row per filtered hit.
         self.report_dropped = bool(getattr(args, "report_dropped", False))
 
+        # File-based seed inputs are ALWAYS sorted by seed ortholog id
+        # before annotation (byte-identical to the previous default; the
+        # opt-out `--unsorted_seeds` was removed). The `sort_entries` flag
+        # is retained in the output header for provenance.
+        self.sort_entries = True
+
+        # Seeds annotated per worker sub-batch (bulk-queried together).
+        self.annot_batch_size = max(1, int(getattr(args, "annot_batch_size", 125) or 125))
+
         self.resume = args.resume
 
         return
+
+    def _go_namespace_split(self) -> bool:
+        """Whether GO will be cascaded per-namespace (MF/BP/CC) rather than in
+        the legacy combined mode. True iff a go-basic.obo is resolvable."""
+        from .batch_annotate import resolve_go_obo_path
+        obo = resolve_go_obo_path()
+        return bool(obo) and pisfile(obo)
 
     def _applied_filters(self) -> dict:
         """Return a dict of the resolved annotation-stage filter values.
@@ -105,12 +126,18 @@ class Annotator:
         return {
             "tax_scope": self.tax_scope,
             "donor_pool": self.donor_pool,
+            "lazy_cascade": self.lazy_cascade,
             "target_orthologs": self.target_orthologs,
             "target_taxa": self.target_taxa,
             "excluded_taxa": self.excluded_taxa,
-            "seed_ortholog_evalue": self.seed_ortholog_evalue,
-            "seed_ortholog_score": self.seed_ortholog_score,
+            "annot_evalue": self.annot_evalue,
+            "annot_score": self.annot_score,
             "pfam_realign": self.pfam_realign,
+            "sort_entries": self.sort_entries,
+            # Records whether GO used the per-namespace (MF/BP/CC) cascade or
+            # the legacy combined fallback, so the two modes are reproducibly
+            # distinguishable from the output file alone (not just a log line).
+            "go_namespace_split": self._go_namespace_split(),
         }
 
 
@@ -257,7 +284,8 @@ class Annotator:
                                                                orthologs_file,
                                                                self.resume,
                                                                self.no_file_comments,
-                                                               eggnog_db=_eggnog_db)
+                                                               eggnog_db=_eggnog_db,
+                                                               applied_filters=self._applied_filters())
 
                 # Count resumed (skip=True) items before stripping the flag.
                 # The counter is a mutable [int] so run_generator can read it
@@ -299,6 +327,13 @@ class Annotator:
         paths were removed in Phase 2.
         """
         print(colorify("Functional annotation of hits...", "lgreen"), file=sys.stderr)
+        if not self._go_namespace_split():
+            print(colorify(
+                "  WARNING: go-basic.obo not found — GO terms will use the LEGACY "
+                "combined cascade (no MF/BP/CC namespace split). This differs from "
+                "reference GO output. Fix: place go-basic.obo in --data_dir or set "
+                "EGGNOG_GO_OBO. Mode recorded as go_namespace_split=False in the "
+                "output header.", "red"), file=sys.stderr)
         eggnog_db = get_eggnog_db()
         return self._annotate_batched(hits_gen_func, annots_parser, eggnog_db)
 
@@ -348,7 +383,9 @@ class Annotator:
                 _worker_init_after_fork,
             )
 
-            engine = _get_engine(eggnog_db, ceiling_resolver, self.donor_pool)
+            engine = _get_engine(
+                eggnog_db, ceiling_resolver, self.donor_pool, self.lazy_cascade
+            )
             _register_worker_engine(engine)
             ctx = multiprocessing.get_context("fork")
             # Workers are long-lived (no maxtasksperchild) to avoid
@@ -384,54 +421,61 @@ class Annotator:
                 # Not in main thread — skip signal forwarding.
                 pass
 
-        # Batch large enough to keep all workers continuously fed.
-        # AnnotationEngine.annotate_batch uses sub_batch_size=125;
-        # 2× headroom keeps all workers busy while limiting the number of
-        # apply_async tasks in flight and the sequential write phase length.
-        batch_size = max(1000, n_workers * 250)
+        # Per-worker sub-batch size (seeds bulk-queried per pool task), tunable
+        # via --annot_batch_size. The outer batch is sized to give every worker
+        # ~2 sub-batches so the pool stays saturated.
+        sub_batch_size = self.annot_batch_size
+        target = max(1000, n_workers * sub_batch_size * 2)
         batch = []
 
+        def _dispatch(b):
+            return annotate_batch(
+                b,
+                eggnog_db,
+                annot=self.annot,
+                target_orthologs=self.target_orthologs,
+                target_taxa=self.target_taxa,
+                excluded_taxa=self.excluded_taxa,
+                seed_ortholog_score=self.annot_score,
+                seed_ortholog_evalue=self.annot_evalue,
+                ceiling_resolver=ceiling_resolver,
+                donor_pool=self.donor_pool,
+                lazy_cascade=self.lazy_cascade,
+                pool=pool,
+                dropped_writer=self._dropped_writer,
+                sub_batch_size=sub_batch_size,
+            )
+
         try:
+            # Seeds arrive sorted (always): size the batch by the number of
+            # DISTINCT seeds (cutting only at block boundaries) rather than by
+            # line count. On redundant inputs a line-count batch can dedup down
+            # to a handful of unique seeds and leave most workers idle; counting
+            # distinct seeds keeps every worker fed with ~sub_batch_size seeds.
+            distinct = 0
+            last_seed = None
+            # Cap the batch's line count too, so a very redundant input
+            # (many queries per seed) can't balloon a single batch's memory
+            # while it waits to reach the distinct-seed target.
+            line_cap = target * 20
             for args_tuple in self.iter_hit_lines(hits_gen_func, annots_parser):
-                # Pass through resumed hits immediately
-                if args_tuple[-1] is not None:  # already annotated
+                if args_tuple[-1] is not None:  # already annotated (resume)
                     yield ((args_tuple[0], args_tuple[-1]), True)
                     continue
-
+                seed = args_tuple[0][1]
+                if seed != last_seed:
+                    # New seed block. Flush a full batch before starting it
+                    # so a block is never split across batches.
+                    if distinct >= target or len(batch) >= line_cap:
+                        yield from _dispatch(batch)
+                        batch = []
+                        distinct = 0
+                    distinct += 1
+                    last_seed = seed
                 batch.append(args_tuple)
 
-                if len(batch) >= batch_size:
-                    yield from annotate_batch(
-                        batch,
-                        eggnog_db,
-                        annot=self.annot,
-                        target_orthologs=self.target_orthologs,
-                        target_taxa=self.target_taxa,
-                        excluded_taxa=self.excluded_taxa,
-                        seed_ortholog_score=self.seed_ortholog_score,
-                        seed_ortholog_evalue=self.seed_ortholog_evalue,
-                        ceiling_resolver=ceiling_resolver,
-                        donor_pool=self.donor_pool,
-                        pool=pool,
-                        dropped_writer=self._dropped_writer,
-                    )
-                    batch = []
-
             if batch:
-                yield from annotate_batch(
-                    batch,
-                    eggnog_db,
-                    annot=self.annot,
-                    target_orthologs=self.target_orthologs,
-                    target_taxa=self.target_taxa,
-                    excluded_taxa=self.excluded_taxa,
-                    seed_ortholog_score=self.seed_ortholog_score,
-                    seed_ortholog_evalue=self.seed_ortholog_evalue,
-                    ceiling_resolver=ceiling_resolver,
-                    donor_pool=self.donor_pool,
-                    pool=pool,
-                    dropped_writer=self._dropped_writer,
-                )
+                yield from _dispatch(batch)
 
         except EmapperException:
             raise
@@ -494,7 +538,7 @@ class Annotator:
                 ``--resume`` mode, or ``None``.
 
         Yields:
-            Tuple ``(hit, annot, seed_ortholog_score, seed_ortholog_evalue,
+            Tuple ``(hit, annot, annot_score, annot_evalue,
             target_taxa, target_orthologs, excluded_taxa,
             data_path, annotation)`` where ``annotation`` is
             the previously computed annotation (or ``None``).
@@ -521,8 +565,8 @@ class Annotator:
             yield_tuple = (
                 hit,
                 self.annot,
-                self.seed_ortholog_score,
-                self.seed_ortholog_evalue,
+                self.annot_score,
+                self.annot_evalue,
                 self.target_taxa,
                 self.target_orthologs,
                 self.excluded_taxa,
@@ -550,10 +594,34 @@ def _count_resumed(annots, counter):
 def parse_annotations(annot, annot_file, report_orthologs, orthologs_file):
     
     if annot == True:
+        expected_ncols = len(output.ANNOTATIONS_WHOLE_HEADER)
+        checked = False
         with open(annot_file, 'r') as annot_f:
             for line in annot_f:
-                if line.startswith("#"): continue
-                
+                if line.startswith("#"):
+                    # Guard: refuse to resume a file written under a different
+                    # column schema (e.g. an older 25-column build); the
+                    # positional parser below would otherwise misread columns
+                    # silently. Fail loudly instead.
+                    if line.startswith("#query\t"):
+                        ncols = len(line.rstrip("\n").split("\t"))
+                        if ncols != expected_ncols:
+                            raise EmapperException(
+                                f"Cannot --resume '{annot_file}': it has a "
+                                f"{ncols}-column header but this build writes "
+                                f"{expected_ncols} columns (annotations schema "
+                                f"changed). Rerun with --override to regenerate.")
+                    continue
+                if not checked:
+                    ncols = len(line.rstrip("\n").split("\t"))
+                    if ncols != expected_ncols:
+                        raise EmapperException(
+                            f"Cannot --resume '{annot_file}': data rows have "
+                            f"{ncols} columns but this build writes "
+                            f"{expected_ncols} (annotations schema changed). "
+                            f"Rerun with --override to regenerate.")
+                    checked = True
+
                 hit, annotation = parse_annotation_line(line)
                 
                 # this assumes the annotated hit it is also present
@@ -567,8 +635,11 @@ def parse_annotations(annot, annot_file, report_orthologs, orthologs_file):
             for line in orth_f:
                 if line.startswith("#"): continue
 
-                # just yield that query already exists in file
-                query_name = line[0]
+                # just yield that query already exists in file.
+                # NB: the query is the first TAB-separated column, not line[0]
+                # (which is the first character) — the latter broke the resume
+                # lockstep and duplicated every ortholog row on --resume.
+                query_name = line.split('\t', 1)[0].strip()
                 if prev_query is not None and query_name != prev_query:
                     annotation = (prev_query, None, None, None,
                                   None, None, None, None, None)
@@ -588,6 +659,29 @@ def parse_annotations(annot, annot_file, report_orthologs, orthologs_file):
     return
 
 def parse_annotation_line(line):
+    """Parse one data line from a 22-column *.emapper.annotations file.
+
+    Column layout (22-column schema, v3 2026-08-12):
+      0  query
+      1  seed_ortholog
+      2  evalue
+      3  score
+      4  eggNOG_OGs
+      5  tax_ceiling
+      6  farthest_donor_lineage
+      7  COG_category
+      8  Preferred_name … 20  PFAMs   (13 annotation-category fields)
+      21 annotation_confidence
+
+    NOTE: --resume across the schema boundary (a partial run written by an
+    older 25-column build resumed under this build) is NOT supported.
+    Resuming against an old 25-column file will misread columns silently.
+    Regenerate from scratch when upgrading.
+
+    Returns:
+        Tuple ``(hit, annotation)`` where ``annotation`` is the full
+        14-element tuple expected by ``output_annotations_row``.
+    """
     hit = None
     annotation = None
 
@@ -598,30 +692,32 @@ def parse_annotation_line(line):
     best_hit_evalue = float(data[2])
     best_hit_score = float(data[3])
     hit = [query_name, best_hit_name, best_hit_evalue, best_hit_score]
-    
+
     annotations = defaultdict(Counter)
-    
+
+    # Annotation-category fields start at data[8] (Preferred_name … PFAMs).
     for i, field in enumerate(data[8:]):
         if i < len(ANNOTATIONS_HEADER):
             field_name = ANNOTATIONS_HEADER[i]
             annotations[field_name] = field.split(",")
-        
-    og_cat_desc = ("-", data[6], data[7]) # ("-", data[5], data[6])
 
-    max_annot_lvl = data[5] # data[7]
-    
+    # data[5]=tax_ceiling, data[6]=farthest_donor_lineage, data[7]=COG_category.
+    # og_desc is no longer in the file; set to "-" to keep the 3-tuple shape.
+    tax_ceiling = data[5]
+    farthest_donor_lineage = data[6]
+    og_cat_desc = ("-", data[7], "-")
+
+    # max_annot_lvl is no longer emitted; use "-" as a neutral placeholder.
+    max_annot_lvl = "-"
+
     match_nog_names = data[4].split(",")
-    
+
     all_orthologies = None
     annot_orthologs = None
 
-    # Pad to the current 14-element shape so that --resume can replay
-    # lines from pre-refactor annotation files through output_annotations_row
-    # without hitting the 14-element `else` branch on a 10-element tuple.
+    # annotation_confidence is in data[21] when present.
     annotations_confidence = None
-    tax_ceiling = "-"
     farthest_donor_taxid = "-"
-    farthest_donor_lineage = "-"
 
     annotation = (query_name, best_hit_name, best_hit_evalue, best_hit_score,
                   annotations,

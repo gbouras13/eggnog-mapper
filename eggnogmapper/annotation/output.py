@@ -10,6 +10,12 @@ from ..common import get_call_info
 from .ncbitaxa.ncbiquery import get_ncbi
 from .db_sqlite import get_eggnog_db
 
+import logging
+
+from eggnogmapper.annotator.e7.constants import TIER_CONFIDENCE as _TIER_CONFIDENCE
+
+_logger = logging.getLogger(__name__)
+
 # Translation table: replace tab, CR, LF, and other ASCII control chars
 # with a single space so no field value can break TSV structure.
 _CTRL_CHARS = "".join(chr(i) for i in range(32) if i not in (9, 10, 13)) + chr(127)
@@ -74,7 +80,8 @@ def _fix_truncated_tail(path):
 # Orthologs
 
 ##
-def output_orthologs(annots, orthologs_file, resume, no_file_comments, eggnog_db=None):
+def output_orthologs(annots, orthologs_file, resume, no_file_comments, eggnog_db=None,
+                     applied_filters=None):
     start_time = time.time()
 
     ncbi = get_ncbi(usemem = True)
@@ -86,7 +93,8 @@ def output_orthologs(annots, orthologs_file, resume, no_file_comments, eggnog_db
         file_mode = 'w'
 
     with open(orthologs_file, file_mode, encoding="utf-8", newline="\n") as ORTHOLOGS_OUT:
-        output_orthologs_header(ORTHOLOGS_OUT, no_file_comments, not resume)
+        output_orthologs_header(ORTHOLOGS_OUT, no_file_comments, not resume,
+                                applied_filters=applied_filters)
 
         qn = 0
         for ((hit, annotation), exists) in annots:
@@ -208,10 +216,12 @@ def output_orthologs_row(out, annotation, ncbi, eggnog_db=None):
     return
 
 ##
-def output_orthologs_header(out, no_file_comments, print_header):
+def output_orthologs_header(out, no_file_comments, print_header, applied_filters=None):
     if print_header:
         if not no_file_comments:
             print(get_call_info(), file=out)
+            if applied_filters:
+                print(format_applied_filters(applied_filters), file=out)
         header = ["#query", "orth_type", "species", "orthologs"]
         print('\t'.join(header), file=out)
     return
@@ -231,43 +241,66 @@ def output_orthologs_footer(out, no_file_comments, qn, elapsed_time):
 
 ##
 
-HIT_HEADER = ["query",
-              "seed_ortholog",
-              "evalue",
-              "score",
-              "eggNOG_OGs",
-              "max_annot_lvl",
-              "COG_category",
-              "Description"]
+# ANNOTATIONS_HEADER: the 13 annotation-category fields, in order.
+# Used as a registry by row builders and the --resume parser; do not reorder.
+ANNOTATIONS_HEADER = [
+    'Preferred_name',
+    'GOs',
+    'EC',
+    'KEGG_ko',
+    'KEGG_Pathway',
+    'KEGG_Module',
+    'KEGG_Reaction',
+    'KEGG_rclass',
+    'BRITE',
+    'KEGG_TC',
+    'CAZy',
+    'BiGG_Reaction',
+    'PFAMs',
+]
 
-ANNOTATIONS_HEADER = ['Preferred_name',
-                      'GOs',
-                      'EC',
-                      'KEGG_ko',
-                      'KEGG_Pathway',
-                      'KEGG_Module',
-                      'KEGG_Reaction',
-                      'KEGG_rclass',
-                      'BRITE',
-                      'KEGG_TC',
-                      'CAZy',
-                      'BiGG_Reaction',
-                      'PFAMs']
+# Derived from TIER_CONFIDENCE — single source of truth for confidence chars.
+# Order = ascending tier key (0=high, 1=medium, 2=low) so the legend reads
+# high→low regardless of insertion order in the source dict.
+_TIER_LEGEND_ENTRIES: tuple[tuple[str, str], ...] = tuple(
+    (_TIER_CONFIDENCE[k][0].lower(), _TIER_CONFIDENCE[k])
+    for k in sorted(_TIER_CONFIDENCE)
+)
 
-# Phase 3c: per-source confidence is appended as a single column. Format
-# is `field=tier;field=tier;...` listing only the fields that were
-# emitted (and therefore got a confidence label). Reading code can split
-# on `;` and `=` without ever quoting tabs.
-#
-# `tax_ceiling`: resolved per-seed ev_lca ceiling clade name (replaces
-# the old `tax_scope_used`).  `farthest_donor_taxid` / `farthest_donor_lineage`:
-# the taxid and full semicolon-separated lineage of the evolutionarily
-# most-distant donor ortholog used.
-ANNOTATIONS_WHOLE_HEADER = HIT_HEADER + ANNOTATIONS_HEADER + [
-    'annotation_confidence',
+# ANNOTATIONS_WHOLE_HEADER: the 22-column schema for *.emapper.annotations.
+# v3 change (2026-08-12): reduced from 25 to 22 columns.
+#   Dropped: Description (v2 legacy; Preferred_name suffices),
+#            max_annot_lvl (derivable as deepest @taxid inside eggNOG_OGs),
+#            farthest_donor_taxid (== last node of farthest_donor_lineage).
+#   tax_ceiling + farthest_donor_lineage promoted into the context block
+#   (positions 6, 7). COG_category heads the functional-sources block
+#   (position 8). annotation_confidence is the last column (position 22).
+#   Per-field confidence is a fixed-width positional string of
+#   len(ANNOTATIONS_HEADER) chars; codes h/m/l/- documented in the
+#   header legend (suppressed by --no_file_comments).
+ANNOTATIONS_WHOLE_HEADER = [
+    'query',
+    'seed_ortholog',
+    'evalue',
+    'score',
+    'eggNOG_OGs',
     'tax_ceiling',
-    'farthest_donor_taxid',
     'farthest_donor_lineage',
+    'COG_category',
+    'Preferred_name',
+    'GOs',
+    'EC',
+    'KEGG_ko',
+    'KEGG_Pathway',
+    'KEGG_Module',
+    'KEGG_Reaction',
+    'KEGG_rclass',
+    'BRITE',
+    'KEGG_TC',
+    'CAZy',
+    'BiGG_Reaction',
+    'PFAMs',
+    'annotation_confidence',
 ]
 
 ##
@@ -308,6 +341,94 @@ def output_annotations(annots, annot_file, resume, no_file_comments, md5_field, 
         elapsed_time = time.time() - start_time
         output_annotations_footer(ANNOTATIONS_OUT, no_file_comments, qn, elapsed_time)
     return
+
+def _conf_char(field: str, conf_dict: dict) -> str:
+    """Return the single confidence character for one annotation field.
+
+    Looks up ``field`` in ``conf_dict`` (values are tier names such as
+    "high", "medium", "low") and returns the first letter lowercased.
+    Absent field → "-". Never raises.
+
+    Args:
+        field: Annotation field name (must be an entry of ANNOTATIONS_HEADER).
+        conf_dict: Mapping ``{field: tier_name}``.
+
+    Returns:
+        Single character in ``{h, m, l, -}`` (derived from tier name).
+    """
+    tier = conf_dict.get(field)
+    if not tier:
+        return "-"
+    return tier[0].lower()
+
+
+def encode_confidence(conf_dict, fields):
+    """Encode per-field annotation confidence as a fixed-width positional string.
+
+    Produces a string of exactly ``len(fields)`` characters, one per field,
+    in ``fields`` order. Character codes are derived from TIER_CONFIDENCE
+    via ``tier_name[0].lower()``. A field absent from ``conf_dict`` encodes
+    as ``-``.
+
+    Robustness invariants:
+      - Field order is dictated entirely by ``fields`` (single source of
+        truth — callers pass ``ANNOTATIONS_HEADER``).
+      - Tier chars derived only via ``tier_name[0].lower()`` from
+        ``TIER_CONFIDENCE``; no independent hardcoded mapping.
+      - ``None`` or empty ``conf_dict`` → ``"-" * len(fields)``.
+      - Unknown ``conf_dict`` keys → WARNING via ``eggnogmapper.annotation.output``
+        logger; never raises.
+
+    Args:
+        conf_dict: Mapping of annotation field name → tier name, e.g.
+            ``{"GOs": "low", "PFAMs": "high"}``. May be ``None`` or empty.
+        fields: Ordered list of field names defining output positions.
+            At runtime this is always ``ANNOTATIONS_HEADER``.
+
+    Returns:
+        String of length ``len(fields)`` composed of characters from
+        ``{h, m, l, -}``. Returns ``"-" * len(fields)`` when ``conf_dict`` is
+        falsy. Returns ``""`` when ``fields`` is empty.
+    """
+    if not conf_dict:
+        return "-" * len(fields)
+
+    encoded = "".join(_conf_char(f, conf_dict) for f in fields)
+
+    # Defensive check for future-dev safety: any key in conf_dict that is not
+    # in `fields` would be silently dropped. Warn so it's caught in review.
+    field_set = set(fields)
+    for key in conf_dict:
+        if key not in field_set:
+            _logger.warning(
+                "encode_confidence: unknown field %r in conf_dict "
+                "(not in ANNOTATIONS_HEADER); ignored",
+                key,
+            )
+
+    return encoded
+
+
+def _legend_lines(fields, tier_legend_entries):
+    """Build the three ``##`` legend comment lines for the confidence column.
+
+    Args:
+        fields: ``ANNOTATIONS_HEADER`` (or equivalent ordered field list).
+        tier_legend_entries: Ordered ``(char, label)`` pairs to render in the
+            codes line. Callers append ``("-", "not annotated")`` so the
+            hyphen sentinel is documented.
+
+    Returns:
+        List of exactly 3 strings, each starting with ``##`` and containing
+        no trailing newline.
+    """
+    codes = " ".join(f"{char}={label}" for char, label in tier_legend_entries)
+    return [
+        "## annotation_confidence: one char per annotation field",
+        f"## confidence codes: {codes}",
+        f"## confidence field order: {' '.join(fields)}",
+    ]
+
 
 ##
 def output_annotations_row(out, annotation, md5_field, md5_queries, eggnog_db=None):
@@ -366,13 +487,7 @@ def output_annotations_row(out, annotation, md5_field, md5_queries, eggnog_db=No
     # Translate integer seed_ortholog to display name.
     seed_display = eggnog_db.get_protein_name(best_hit_name)
 
-    if annotations_confidence:
-        conf_str = ";".join(
-            f"{field}={tier}"
-            for field, tier in sorted(annotations_confidence.items())
-        )
-    else:
-        conf_str = "-"
+    conf_str = encode_confidence(annotations_confidence, ANNOTATIONS_HEADER)
 
     annot_columns = [
         query_name,
@@ -380,9 +495,9 @@ def output_annotations_row(out, annotation, md5_field, md5_queries, eggnog_db=No
         str(best_hit_evalue),
         str(best_hit_score),
         ",".join(match_nog_names),
-        str(max_annot_lvl),
+        tax_ceiling or "-",
+        farthest_donor_lineage or "-",
         og_cat,
-        og_desc,
     ]
 
     for h in ANNOTATIONS_HEADER:
@@ -392,9 +507,6 @@ def output_annotations_row(out, annotation, md5_field, md5_queries, eggnog_db=No
             annot_columns.append("-")
 
     annot_columns.append(conf_str)
-    annot_columns.append(tax_ceiling or "-")
-    annot_columns.append(farthest_donor_taxid or "-")
-    annot_columns.append(farthest_donor_lineage or "-")
 
     if md5_field is True:
         annot_columns.append(md5_queries.get(query_name, "-"))
@@ -409,12 +521,14 @@ def output_annotations_header(out, no_file_comments, md5_field, print_header,
     if print_header:
         if not no_file_comments:
             print(get_call_info(), file=out)
-            # Phase 7.1a — record the resolved values of every annotation-stage
-            # filter and threshold the run actually used. Closes the v3 docs gap
-            # where reproducibility relied on parsing the raw command line on
-            # line 3 (defaults were never expanded).
             if applied_filters:
                 print(format_applied_filters(applied_filters), file=out)
+            # Legend for the annotation_confidence positional encoding.
+            # Derived from ANNOTATIONS_HEADER + TIER_CONFIDENCE — single sources
+            # of truth. Suppressed by --no_file_comments (documented in USAGE).
+            _legend_entries = _TIER_LEGEND_ENTRIES + (("-", "not annotated"),)
+            for line in _legend_lines(ANNOTATIONS_HEADER, _legend_entries):
+                print(line, file=out)
         print("#", end="", file=out)
         annot_header = ANNOTATIONS_WHOLE_HEADER
         if md5_field == True:
@@ -442,7 +556,6 @@ def format_applied_filters(filters: dict) -> str:
             rendered = str(value)
         lines.append(f"##   {key}={rendered}")
     return "\n".join(lines)
-
 
 
 ##
@@ -570,16 +683,26 @@ def output_excel_row(worksheet, row, annotation, md5_field, md5_queries):
          farthest_donor_taxid,
          farthest_donor_lineage) = annotation
 
-    annot_columns = [query_name, best_hit_name, str(best_hit_evalue), str(best_hit_score),
-                     ",".join(match_nog_names), str(max_annot_lvl),
-                     og_cat, og_desc]
-    
+    conf_str = encode_confidence(annotations_confidence, ANNOTATIONS_HEADER)
+
+    annot_columns = [
+        query_name,
+        best_hit_name,
+        str(best_hit_evalue),
+        str(best_hit_score),
+        ",".join(match_nog_names),
+        tax_ceiling or "-",
+        farthest_donor_lineage or "-",
+        og_cat,
+    ]
+
     for h in ANNOTATIONS_HEADER:
         if h in annotations and annotations[h] is not None:
             annot_columns.append(",".join(sorted(list(annotations[h]))))
         else:
             annot_columns.append('-')
-                    
+    annot_columns.append(conf_str)
+
     if md5_field == True:
         query_name = annot_columns[0]
         if query_name in md5_queries:
