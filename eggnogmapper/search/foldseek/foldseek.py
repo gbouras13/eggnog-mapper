@@ -72,7 +72,6 @@ class FoldseekSearcher:
 
     in_file = None
     itype = None
-    translate = None
     translation_table = None
 
     allow_overlaps = None
@@ -84,7 +83,6 @@ class FoldseekSearcher:
     def __init__(self, args):
 
         self.itype = args.itype
-        self.translate = args.translate
         self.translation_table = args.trans_table
 
         self.allow_overlaps = args.allow_overlaps
@@ -252,7 +250,9 @@ class FoldseekSearcher:
 
         handle = None
         try:
-            if self.itype == ITYPE_CDS and self.translate == True:
+            if self.itype == ITYPE_CDS:
+                # CDS always translated to proteins before search; ModernProst
+                # predicts the structural alphabets from amino acids.
                 handle, query_file = mkstemp(dir = self.temp_dir, text = True)
                 translate_cds_to_prots(fasta_file, query_file, self.translation_table)
             else:
