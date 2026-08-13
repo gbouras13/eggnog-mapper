@@ -195,7 +195,7 @@ class TestTargetOrthologs:
 
 
 class TestInvalidSeedId:
-    """Non-integer seed IDs must emit a warning and yield (hit, None)."""
+    """Seed IDs that are neither integers nor known protein names are dropped."""
 
     def test_non_integer_hit_name_emits_warning(self, caplog):
         """Provide a non-integer best_hit_name; check logger.warning is called."""
@@ -207,6 +207,9 @@ class TestInvalidSeedId:
         mock_db = MagicMock()
         mock_db.conn = object()
         mock_db._taxids = []
+        # A v5-style name is looked up in protein_names before being dropped;
+        # this one is not in the DB, so resolution fails and the hit drops.
+        mock_db.get_protein_id.return_value = None
 
         ceiling_resolver = _make_ceiling_resolver()
 
@@ -235,6 +238,50 @@ class TestInvalidSeedId:
         assert len(results) == 1
         (returned_hit, annotation), _ = results[0]
         assert annotation is None
+
+    def test_v5_style_name_is_resolved_via_protein_names(self):
+        """A "TAXID.PROTEIN" seed is resolved to its integer ID, not dropped.
+
+        Databases converted from eggNOG v5 have search DBs whose sequences are
+        named this way rather than by integer protein ID.
+        """
+        hit = _make_hit("1000565.METUNv1_03812")
+
+        from eggnogmapper.annotation.batch_annotate import annotate_batch
+        import eggnogmapper.annotation.batch_annotate as bat_mod
+
+        mock_db = MagicMock()
+        mock_db.conn = object()
+        mock_db._taxids = []
+        mock_db.get_protein_id.return_value = 4242
+
+        # The seed now resolves, so the engine is reached; stub it out since
+        # this test is only about seed-ID resolution.
+        mock_engine = MagicMock()
+        mock_engine.annotate_batch.return_value = {}
+
+        dropped = []
+        with patch.object(bat_mod, "_get_engine", return_value=mock_engine):
+            list(
+                annotate_batch(
+                    batch=_make_batch_args(hit),
+                    eggnog_db=mock_db,
+                    annot=True,
+                    target_orthologs="all",
+                    target_taxa=None,
+                    excluded_taxa=None,
+                    seed_ortholog_score=60.0,
+                    seed_ortholog_evalue=1e-3,
+                    ceiling_resolver=_make_ceiling_resolver(),
+                    dropped_writer=lambda *a: dropped.append(a),
+                )
+            )
+
+        # the engine must have been asked about the resolved integer ID
+        assert mock_engine.annotate_batch.call_args[0][0] == [4242]
+
+        mock_db.get_protein_id.assert_called_once_with("1000565.METUNv1_03812")
+        assert not [d for d in dropped if d[1] == "unresolvable_seed_id"], dropped
 
 
 class TestAnnotationTupleStructure:

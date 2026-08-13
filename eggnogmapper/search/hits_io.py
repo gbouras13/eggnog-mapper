@@ -45,8 +45,10 @@ def output_seeds(cmds, hits, out_file, no_file_comments, change_seeds_coords = F
         if not no_file_comments:
             print(get_call_info(), file=OUT)
             if cmds is not None:
+                # str(): some searcher steps (e.g. Foldseek createdb, which runs
+                # in-process) contribute no shell command and append None.
                 for cmd in cmds:
-                    print('##'+cmd, file=OUT)
+                    print('##'+str(cmd), file=OUT)
 
         # header
         print('#'+"\t".join(("qseqid sseqid evalue bitscore qstart qend "

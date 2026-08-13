@@ -74,6 +74,13 @@ python emapper.py -m mmseqs -i seqs.fa -o out
 # HMMER (profile-based, most accurate for specific taxonomic groups)
 python emapper.py -m hmmer -i seqs.fa -d bact -o out
 
+# Foldseek over predicted 3Di structures (most sensitive for remote homologs)
+python emapper.py -m foldseek -i seqs.fa -o out
+
+# Two-stage: DIAMOND (or MMseqs2) first, then Foldseek on whatever it missed
+python emapper.py -m diamond-foldseek -i seqs.fa -o out
+python emapper.py -m mmseqs-foldseek -i seqs.fa -o out
+
 # Novel families (for uncharacterized protein families)
 python emapper.py -m novel_fams -i seqs.fa -o out
 
@@ -83,6 +90,176 @@ python emapper.py -m no_search --annotate_hits_table prev.emapper.seed_orthologs
 # Cache-based annotation
 python emapper.py -m cache -i seqs.fa -c cache_file.txt -o out
 ```
+
+### Foldseek Search Modes
+
+`-m foldseek` predicts structural alphabets for each query with
+[ModernProst](https://huggingface.co/gbouras13/modernprost-50M-pssm) and searches
+them against a Foldseek database of eggNOG proteins. It finds remote homologs
+that sequence search misses, at a significantly higher compute cost.
+
+Two alphabets are predicted in a single forward pass of the model:
+
+- **3Di** — 20 states, Foldseek's standard structural alphabet.
+- **12-state** — 12 additional states used as a second scoring channel,
+  controlled by `--ss_12st` (default on). Stored one of two ways, both native
+  to Foldseek: packed into the same `_ss` entry as the 3Di states for discrete
+  queries (one byte per residue, `3Di * 12 + 12st`), or as a sibling
+  `<querydb>_ss12` PSSM database under `--profiles`.
+
+Requirements beyond the standard install:
+
+```bash
+# 1. the foldseek binary on PATH
+conda install -c bioconda foldseek
+
+# 2. the Python inference stack (torch + transformers, ~2.5 GB)
+pip install eggnog-mapper[foldseek]
+```
+
+Or build the whole environment, search backends included, from the bundled
+spec — see the comments in it for the CUDA/CPU torch choice and for the
+12-state Foldseek build:
+
+```bash
+conda env create -f environment-foldseek.yml   # mamba/micromamba also work
+conda activate eggnog-foldseek
+pip install .
+```
+
+The 12-state alphabet needs a Foldseek build that supports it (one providing
+`--ss-12st`). With an older Foldseek, pass `--ss_12st 0`.
+
+The model weights are downloaded on first use into `<data_dir>/foldseek`
+(override with `--hf_cache_dir`). The Foldseek target DB is expected at
+`<data_dir>/foldseek/foldseek.db`; it is not fetched by
+`download_eggnog_data.py` and must be built separately.
+
+```bash
+# Foldseek only
+python emapper.py -m foldseek -i proteins.fa -o out
+
+# 3Di only, for an older Foldseek or an older target DB
+python emapper.py -m foldseek --ss_12st 0 -i proteins.fa -o out
+
+# Recommended: search the clustered DB — the full DB is much slower
+python emapper.py -m foldseek --foldseek_cluster_db -i proteins.fa -o out
+
+# Keep more than the single best structural hit as seed ortholog candidates
+python emapper.py -m foldseek --foldseek_top_hits 5 -i proteins.fa -o out
+
+# Trade sensitivity for speed (default 9.5)
+python emapper.py -m foldseek --foldseek_sensitivity 7 --foldseek_max_seqs 1000 \
+    -i proteins.fa -o out
+
+# ModernProst inference batching (tune to fit GPU/CPU memory)
+python emapper.py -m foldseek --batch_size 40 --max_batch_residues 100000 \
+    -i proteins.fa -o out
+```
+
+#### The target DB must also carry the 12-state alphabet
+
+`--ss_12st 1` only pays off if the *target* database has the 12-state states
+too. Foldseek flags this in `<db>_ss.dbtype`: the high half of that little-endian
+int32 has bit 32 set (so a 12-state `_ss` reads `[0, 0, 32, 0]`, versus
+`[0, 0, 0, 0]` for a 3Di-only one).
+
+Searching a 12-state query against a 3Di-only target is **not** an error —
+Foldseek silently falls back to scoring 3Di alone, giving exactly the same
+scores as `--ss_12st 0`. eggnog-mapper prints a warning when it detects this,
+because the flag would otherwise appear to work while doing nothing. To fix it,
+either rebuild the target DB with a 12-state-capable Foldseek, or upgrade an
+existing one in place:
+
+```bash
+# adds the 12-state alphabet to <db>_ss, keeping the old one as <db>_ss_old
+foldseek add12st /path/to/foldseek.db
+```
+
+`add12st` predicts the 12 states from the database's CA coordinates (`_ca`), so
+it only works on a DB built from real structures.
+
+#### Two-stage modes
+
+`-m diamond-foldseek` and `-m mmseqs-foldseek` run the sequence searcher first,
+then Foldseek over only the queries that came out unannotated. This gets most of
+Foldseek's extra recall for a fraction of its cost.
+
+The queries left over from stage 1 are written to
+`<prefix>.emapper.no_hits.fasta`, and the Foldseek stage writes its own set of
+outputs under the `<prefix>.foldseek.extra.emapper.*` prefix, so the two stages
+never overwrite each other:
+
+```
+out.emapper.seed_orthologs                     # stage 1 (DIAMOND/MMseqs2)
+out.emapper.annotations
+out.emapper.no_hits.fasta                      # queries stage 1 did not annotate
+out.foldseek.extra.emapper.seed_orthologs      # stage 2 (Foldseek)
+out.foldseek.extra.emapper.annotations
+```
+
+`--profiles` builds the query `_ss` as an MMseqs PSSM database instead of a
+discrete sequence. The 12-state channel still applies there, just in a
+different on-disk form: a sibling `<querydb>_ss12` PSSM database, which is
+what Foldseek looks for when the query `_ss` is not a packed 3Di+12st
+sequence. Both forms are written automatically, so `--ss_12st 1` works with
+and without `--profiles`.
+
+These two modes require `--itype proteins` or `--itype CDS`. They identify the
+leftover queries by matching against the input FASTA headers, which gene
+prediction invalidates (it renames queries to `contig_0`, `contig_1`, …). For
+genome/metagenome input, run `-m foldseek` on its own.
+
+#### GPU acceleration
+
+`--gpu` switches MMseqs2 and Foldseek to their GPU prefilter
+(`--gpu 1 --prefilter-mode 1`), which replaces the sensitivity ladder. It
+requires GPU-padded target databases alongside the normal ones:
+
+```bash
+mmseqs   makepaddedseqdb mmseqs.db   mmseqs.db.gpu   --threads 16
+foldseek makepaddedseqdb foldseek.db foldseek.db.gpu --threads 16
+# clustered DB
+foldseek makepaddedseqdb foldseek.db.clustered.searchDB \
+    foldseek.db.clustered.searchDB.gpu --threads 16 --cluster-search 1
+```
+
+`--gpu` then selects the `*.gpu` DB automatically; an explicit `--mmseqs_db` /
+`--foldseek_db` still wins.
+
+### Annotating against a legacy eggNOG v5 database
+
+v3's annotator reads the v7 schema, so a v5 `eggnog.db` cannot be used
+directly. `scripts/v5_to_v7_db.py` rewrites one into the v7 core schema:
+
+```bash
+# fetch the v5 set (the v7 set is not published yet)
+python download_eggnog_data.py -y --no-verify --db_version 5.0.2 --data_dir DIR
+
+# convert; --taxa-db enables computed ev_lca instead of the v5 event level
+python scripts/v5_to_v7_db.py DIR/eggnog.db DIR/eggnog.db.v7 \
+    --taxa-db DIR/eggnog.taxa.db
+mv DIR/eggnog.db.v7 DIR/eggnog.db
+```
+
+Two v7 columns have no v5 source and are reconstructed by the script:
+
+- `sp_overlap` — species-set Jaccard between the two event sides, computed
+  from the taxid prefixes of the member names. Faithful.
+- `ev_lca` — the event's LCA taxid. Computed from the taxonomy when
+  `--taxa-db` is given; otherwise it falls back to the v5 event level.
+
+**The result is v3's annotation logic over v5-derived data — not equivalent
+to eggnog-mapper 2.x output on the same database.** v3 filters donors per
+seed by `ev_lca` ceiling and `sp_overlap`, for which v5 holds no
+authoritative values. Use it to exercise the v3 pipeline on v5 data, not as
+a substitute for a real v7 build.
+
+Search databases built from v5 sequences name their targets
+`TAXID.PROTEIN`, whereas v7 target DBs use integer protein IDs. Seeds in
+either form are accepted: a non-integer seed is resolved through
+`protein_names`, and only an unresolvable one is dropped (reason
+`unresolvable_seed_id` in the `--report_dropped` log).
 
 ### Database Backend Selection
 

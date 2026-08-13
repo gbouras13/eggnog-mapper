@@ -7,6 +7,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Foldseek structural search modes.** `-m foldseek` predicts structural
+  alphabets for each query with ModernProst and searches them against a
+  Foldseek database of eggNOG proteins, recovering remote homologs that
+  sequence search misses.
+- **12-state structural alphabet alongside 3Di.** The ModernProst model
+  (`gbouras13/modernprost-50M-pssm`, `ModernProst3Di12StModel`) predicts
+  both a 20-state 3Di and a 12-state alphabet in one forward pass. Both
+  are packed into the query `_ss` database one byte per residue
+  (`3Di * 12 + 12st`, dbtype flagged with `DBTYPE_EXTENDED_3DI_12ST`), so
+  Foldseek can score two structural channels. Controlled by `--ss_12st`
+  (default 1); requires a Foldseek providing `--ss-12st`.
+  - Against a target DB built without the 12 states, Foldseek falls back
+    to 3Di-only scoring; eggnog-mapper warns rather than failing, since
+    the flag would otherwise look effective while changing nothing.
+    Upgrade such a DB with `foldseek add12st`.
+  - `--profiles` writes `_ss` as an MMseqs PSSM database, which cannot
+    hold the packed byte, so it forces `--ss_12st 0`.
+- **Two-stage `-m diamond-foldseek` and `-m mmseqs-foldseek`.** Run the
+  sequence searcher first, then Foldseek over only the queries it left
+  unannotated. The leftovers are written to
+  `<prefix>.emapper.no_hits.fasta` and the Foldseek stage writes its own
+  outputs under `<prefix>.foldseek.extra.emapper.*`. Requires
+  `--itype proteins` or `--itype CDS`.
+- **Foldseek options:** `--foldseek_db`, `--foldseek_cluster_db`,
+  `--foldseek_top_hits`, `--foldseek_max_seqs`, `--foldseek_sensitivity`,
+  `--ss_12st`, `--hf_cache_dir`, `--batch_size`, `--max_batch_residues`,
+  `--profiles`.
+- **`--gpu`** enables the GPU prefilter (`--gpu 1 --prefilter-mode 1`) for
+  MMseqs2 and Foldseek, selecting the GPU-padded `*.gpu` target databases.
+- `torch`/`transformers`/`tqdm`/`numpy` are an optional extra, needed only
+  by the Foldseek modes: `pip install eggnog-mapper[foldseek]`. The
+  Foldseek searcher is imported lazily so these stay optional.
+- The Apptainer image now installs the `foldseek` binary; build with
+  `--build-arg INSTALL_FOLDSEEK_DEPS=true` to bake in the Python stack too.
+
 ### Changed
 
 - **`--tax_scope` now accepts `auto` (default), `auto-broad`, or a fixed

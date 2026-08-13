@@ -9,6 +9,14 @@ data/*
 !.gitkeep
 *_old
 *old*
+# CAREFUL: "*old*" matches "f-old-seek", so it silently ignores every
+# foldseek-named path. This negation must come after it and must stay.
+!*foldseek*
+# ...but a Hugging Face model cache landing in a data dir is still not source
+tests/fixtures/foldseek/
+**/models--*/
+!eggnogmapper/search/foldseek/
+!eggnogmapper/search/foldseek/**
 .venv/
 __pycache__/
 *.egg-info/
@@ -22,3 +30,8 @@ build/
 # Test scratch output
 tests/integration/out/
 tests/integration/out_v7/
+
+# local eggNOG data download dir
+eggnongdb/
+eggnongdb_v7/
+runs/

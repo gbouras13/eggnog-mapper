@@ -7,8 +7,12 @@ From: python:3.12-slim-bookworm
     EMAPPER_VERSION=3.0.0
     DIAMOND_VERSION=2.1.24
     MMSEQS_VERSION=latest
+    FOLDSEEK_VERSION=latest
     HMMER_VERSION=3.4
     PRODIGAL_VERSION=2.6.3
+    # The Foldseek search modes also need torch + transformers (~2.5 GB).
+    # Set to true to bake them in: --build-arg INSTALL_FOLDSEEK_DEPS=true
+    INSTALL_FOLDSEEK_DEPS=false
 
 %labels
     org.opencontainers.image.title       eggNOG-mapper
@@ -18,6 +22,7 @@ From: python:3.12-slim-bookworm
     maintainer                           j.huerta@upm.es
     diamond_version                      {{ DIAMOND_VERSION }}
     mmseqs2_version                      {{ MMSEQS_VERSION }}
+    foldseek_version                     {{ FOLDSEEK_VERSION }}
     hmmer_version                        {{ HMMER_VERSION }}
     prodigal_version                     {{ PRODIGAL_VERSION }}
 
@@ -26,7 +31,7 @@ From: python:3.12-slim-bookworm
     /tmp/emapper-src.tar.gz /opt/emapper-src.tar.gz
 
 %environment
-    export PATH=/opt/diamond:/opt/mmseqs/bin:/opt/hmmer/bin:/opt/prodigal:$PATH
+    export PATH=/opt/diamond:/opt/mmseqs/bin:/opt/foldseek/bin:/opt/hmmer/bin:/opt/prodigal:$PATH
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
 
@@ -64,6 +69,17 @@ From: python:3.12-slim-bookworm
             | tar -xz -C /opt
     fi
 
+    # ── Foldseek {{ FOLDSEEK_VERSION }} ──────────────────────────────────────
+    # Needed by the -m foldseek / diamond-foldseek / mmseqs-foldseek modes.
+    if [ "{{ FOLDSEEK_VERSION }}" = "latest" ]; then
+        curl -sL https://mmseqs.com/foldseek/foldseek-linux-avx2.tar.gz \
+            | tar -xz -C /opt
+    else
+        curl -sL \
+            https://github.com/steineggerlab/foldseek/releases/download/{{ FOLDSEEK_VERSION }}/foldseek-linux-avx2.tar.gz \
+            | tar -xz -C /opt
+    fi
+
     # ── HMMER {{ HMMER_VERSION }} (compiled from source) ─────────────────────
     mkdir -p /tmp/hmmer-build
     curl -sL http://eddylab.org/software/hmmer/hmmer-{{ HMMER_VERSION }}.tar.gz \
@@ -89,14 +105,21 @@ From: python:3.12-slim-bookworm
 
     mkdir -p /opt/emapper-src
     tar -xzf /opt/emapper-src.tar.gz -C /opt/emapper-src
-    python3.12 -m pip install --break-system-packages --no-cache-dir /opt/emapper-src
+    if [ "{{ INSTALL_FOLDSEEK_DEPS }}" = "true" ]; then
+        # torch + transformers for ModernProst 3Di inference (adds ~2.5 GB)
+        python3.12 -m pip install --break-system-packages --no-cache-dir \
+            "/opt/emapper-src[foldseek]"
+    else
+        python3.12 -m pip install --break-system-packages --no-cache-dir /opt/emapper-src
+    fi
     rm -rf /opt/emapper-src /opt/emapper-src.tar.gz
 
     # ── smoke test ───────────────────────────────────────────────────────────
-    export PATH=/opt/diamond:/opt/mmseqs/bin:/opt/hmmer/bin:/opt/prodigal:$PATH
+    export PATH=/opt/diamond:/opt/mmseqs/bin:/opt/foldseek/bin:/opt/hmmer/bin:/opt/prodigal:$PATH
     emapper.py --version
     diamond --version
     mmseqs version
+    foldseek version
     hmmsearch -h 2>&1 | head -2
     prodigal -v 2>&1 | head -2
 
@@ -104,10 +127,11 @@ From: python:3.12-slim-bookworm
     exec emapper.py "$@"
 
 %test
-    export PATH=/opt/diamond:/opt/mmseqs/bin:/opt/hmmer/bin:/opt/prodigal:$PATH
+    export PATH=/opt/diamond:/opt/mmseqs/bin:/opt/foldseek/bin:/opt/hmmer/bin:/opt/prodigal:$PATH
     emapper.py --version
     diamond --version
     mmseqs version
+    foldseek version
     hmmsearch -h 2>&1 | head -2
     prodigal -v 2>&1 | head -2
     python3.12 -c "

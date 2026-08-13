@@ -61,12 +61,20 @@ redesigned annotation engine.
 | [DIAMOND](https://github.com/bbuchfink/diamond) | `conda install -c bioconda diamond` |
 | [HMMER](http://hmmer.org) | `conda install -c bioconda hmmer` |
 | [MMseqs2](https://github.com/soedinglab/MMseqs2) | `conda install -c bioconda mmseqs2` |
+| [Foldseek](https://github.com/steineggerlab/foldseek) | `conda install -c bioconda foldseek` (structural search modes only) |
 | [Prodigal](https://github.com/hyattpd/Prodigal) | `conda install -c bioconda prodigal` (gene prediction only) |
 
 ## Installation
 
 ```bash
 pip install eggnog-mapper
+```
+
+The Foldseek search modes additionally need `torch` and `transformers`
+(~2.5 GB), which are not installed by default:
+
+```bash
+pip install eggnog-mapper[foldseek]
 ```
 
 Or from source:
@@ -99,7 +107,30 @@ emapper.py -m diamond -i proteins.fa --itype proteins \
 emapper.py -m no_search --annotate_hits_table results/my_annotation.emapper.seed_orthologs \
     --data_dir /path/to/eggnog-data \
     -o my_annotation --output_dir results/
+
+# DIAMOND first, then Foldseek structural search on whatever it missed
+emapper.py -m diamond-foldseek -i proteins.fa --itype proteins \
+    --foldseek_cluster_db --data_dir /path/to/eggnog-data \
+    -o my_annotation --output_dir results/ --cpu 20
 ```
+
+### Structural search with Foldseek
+
+`-m foldseek` predicts structural alphabets per query with ModernProst and
+searches them with Foldseek, recovering remote homologs that sequence search
+misses. Both the 20-state **3Di** and the 12-state alphabet are predicted and
+packed into the query database, giving Foldseek two scoring channels
+(`--ss_12st 0` for 3Di only). `-m diamond-foldseek` / `-m mmseqs-foldseek` run
+the sequence search first and fall back to Foldseek only for the queries left
+unannotated, which is usually the better cost/recall trade-off. `--gpu` enables
+the GPU prefilter for MMseqs2 and Foldseek.
+
+The 12-state alphabet requires a Foldseek build that provides `--ss-12st`, and a
+target database built with it — against a 3Di-only target, Foldseek silently
+scores 3Di alone (eggnog-mapper warns when it sees this). The Foldseek target
+database is not distributed by `download_eggnog_data.py` and must be built
+separately into `<data_dir>/foldseek/`. See
+[USAGE.md](USAGE.md#foldseek-search-modes) for the full option reference.
 
 ## Documentation
 

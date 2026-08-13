@@ -71,6 +71,8 @@ class AnnotDB:
 
         from .codec import decode_intlist
         self._decode_intlist = decode_intlist
+        # name -> integer id cache for get_protein_id()
+        self._name_to_id = {}
         curs.execute("SELECT MAX(id) FROM protein_names")
         max_id = curs.fetchone()[0] or 0
         self._taxids = array.array("i", [0]) * (max_id + 1)
@@ -123,3 +125,22 @@ class AnnotDB:
         )
         row = cur.fetchone()
         return row[0] if row else str(protein_id)
+
+    def get_protein_id(self, name):
+        """Encode a protein name ("TAXID.PROTEIN") to its integer ID, or None.
+
+        The inverse of get_protein_name. Needed when the search step emitted
+        protein *names* as seed orthologs rather than the integer IDs a v7
+        target DB carries — i.e. when the DIAMOND/MMseqs/Foldseek database was
+        built from eggNOG v5 sequences.
+        """
+        cached = self._name_to_id.get(name)
+        if cached is not None:
+            return cached
+        cur = self.conn.cursor()
+        cur.execute("SELECT id FROM protein_names WHERE name = ?", (name,))
+        row = cur.fetchone()
+        pid = row[0] if row else None
+        if pid is not None and len(self._name_to_id) < 200_000:
+            self._name_to_id[name] = pid
+        return pid

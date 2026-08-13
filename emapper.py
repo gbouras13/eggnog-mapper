@@ -19,7 +19,9 @@ from eggnogmapper.genepred.genepred_modes import GENEPRED_MODE_SEARCH, GENEPRED_
 
 from eggnogmapper.search.search_modes import \
     SEARCH_MODE_NO_SEARCH, SEARCH_MODE_DIAMOND, \
-    SEARCH_MODE_HMMER, SEARCH_MODE_MMSEQS2, get_eggnog_dmnd_db
+    SEARCH_MODE_HMMER, SEARCH_MODE_MMSEQS2, SEARCH_MODE_FOLDSEEK, \
+    SEARCH_MODE_DIAMOND_FOLDSEEK, SEARCH_MODE_MMSEQS2_FOLDSEEK, \
+    ALL_SEARCH_MODES, DIAMOND_MODES, MMSEQS_MODES, FOLDSEEK_MODES, get_eggnog_dmnd_db
 
 from eggnogmapper.search.diamond.diamond import SENSMODES, SENSMODE_SENSITIVE, \
     ALLOW_OVERLAPS_NONE, ALLOW_OVERLAPS_ALL, ALLOW_OVERLAPS_DIFF_FRAME, ALLOW_OVERLAPS_OPPOSITE_STRAND, \
@@ -43,6 +45,7 @@ TAX_SCOPE_AUTO_BROAD = "auto-broad"
 
 from eggnogmapper.common import existing_file, existing_dir, get_data_path, set_data_path, pexists, \
     get_eggnogdb_file, get_eggnog_mmseqs_db, \
+    resolve_mmseqs_db, resolve_foldseek_db, \
     get_version, get_full_version_info, get_citation, get_call_info, \
     ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META, \
     MP_START_METHOD_DEFAULT, MP_START_METHOD_FORK, MP_START_METHOD_SPAWN, MP_START_METHOD_FORKSERVER, \
@@ -179,14 +182,26 @@ def create_arg_parser():
     pg_search = parser.add_argument_group('Search Options')
 
     pg_search.add_argument('-m', dest='mode',
-                           choices = [SEARCH_MODE_DIAMOND, SEARCH_MODE_MMSEQS2, SEARCH_MODE_HMMER, SEARCH_MODE_NO_SEARCH],
+                           choices = [SEARCH_MODE_DIAMOND, SEARCH_MODE_MMSEQS2, SEARCH_MODE_FOLDSEEK,
+                                      SEARCH_MODE_DIAMOND_FOLDSEEK, SEARCH_MODE_MMSEQS2_FOLDSEEK,
+                                      SEARCH_MODE_HMMER, SEARCH_MODE_NO_SEARCH],
                            default=SEARCH_MODE_DIAMOND,
                            help=(
                                f'{SEARCH_MODE_DIAMOND}: search seed orthologs using diamond (-i is required). '
                                f'{SEARCH_MODE_MMSEQS2}: search seed orthologs using MMseqs2 (-i is required). '
+                               f'{SEARCH_MODE_FOLDSEEK}: search seed orthologs using Foldseek over ModernProst-predicted '
+                               f'3Di structures (-i is required). '
+                               f'{SEARCH_MODE_DIAMOND_FOLDSEEK}: search using diamond, then Foldseek over the queries '
+                               f'left unannotated (-i is required). '
+                               f'{SEARCH_MODE_MMSEQS2_FOLDSEEK}: search using MMseqs2, then Foldseek over the queries '
+                               f'left unannotated (-i is required). '
                                f'{SEARCH_MODE_HMMER}: search seed orthologs using HMMER. (-i is required). '
                                f'{SEARCH_MODE_NO_SEARCH}: skip seed orthologs search (--annotate_hits_table is required, unless --no_annot). '
                            ))
+
+    pg_search.add_argument('--gpu', action="store_true",
+                           help=("Use the GPU-accelerated MMseqs2/Foldseek prefilter. "
+                                 "Requires the GPU-padded target DB (*.gpu)."))
 
     ##
     pg_diamond_mmseqs = parser.add_argument_group('Search filtering common options')
@@ -313,7 +328,75 @@ def create_arg_parser():
 
     pg_mmseqs.add_argument('--mmseqs_sub_mat', dest='mmseqs_sub_mat', default=None, type=str, metavar='SUBS_MATRIX',
                            help="Matrix to be used for --sub-mat MMseqs2 search option. Default=default used by MMseqs2")
-    
+
+    ##
+    pg_foldseek = parser.add_argument_group('Foldseek Search Options')
+
+    pg_foldseek.add_argument('--foldseek_db', dest="foldseek_db", metavar='FOLDSEEK_DB_FILE',
+                             help="Path to Foldseek-compatible database")
+
+    pg_foldseek.add_argument('--foldseek_cluster_db', action="store_true",
+                             help=("Search the clustered Foldseek DB "
+                                   "(recommended: the full DB is much slower)"))
+
+    pg_foldseek.add_argument('--foldseek_top_hits', dest="foldseek_top_hits", default=1, type=int,
+                             metavar='FOLDSEEK_TOP_HITS',
+                             help="Number of Foldseek top hits to keep for seed ortholog searching")
+
+    pg_foldseek.add_argument('--foldseek_max_seqs', dest="foldseek_max_seqs", default=10000, type=int,
+                             metavar='FOLDSEEK_MAX_SEQS',
+                             help="Foldseek max seqs (affects sensitivity)")
+
+    pg_foldseek.add_argument('--foldseek_sensitivity', default=9.5, type=float, metavar='SENS',
+                             help="Foldseek sensitivity (-s). Ignored when --gpu is used.")
+
+    pg_foldseek.add_argument('--ss_12st', dest='ss_12st', default=1, type=int, choices=[0, 1],
+                             help=("Use the 12-state structural alphabet alongside 3Di "
+                                   "(Foldseek --ss-12st). Requires a Foldseek build and a "
+                                   "target DB with 12-state support. 0 searches with 3Di "
+                                   "only. Forced to 0 by --profiles."))
+
+    pg_foldseek.add_argument('--evalue_nn_mode', dest='evalue_nn_mode', default=None,
+                             type=int, choices=[0, 1, 2],
+                             help=("Foldseek --evalue-nn-mode: which composition network "
+                                   "calibrates E-values. 0=3Di only, 1=windowed, "
+                                   "2=3Di+12-state. Default: 2 whenever --ss_12st is on, "
+                                   "so the calibration matches the scoring; Foldseek's own "
+                                   "default of 0 would under-estimate E-values."))
+
+    pg_foldseek.add_argument('--evalue_12st_profile_comp', dest='evalue_12st_profile_comp',
+                             default=None, type=int, choices=[0, 1],
+                             help=("Foldseek --evalue-12st-profile-comp, for --evalue_nn_mode 2 "
+                                   "with --profiles: where the network takes the query "
+                                   "composition from. 0=center/query sequence, "
+                                   "1=recover from profile scores."))
+
+    pg_foldseek.add_argument('--use_reverse_score', dest='use_reverse_score', default=1,
+                             type=int, choices=[0, 1],
+                             help=("Foldseek --use-reverse-score: subtract the reverse "
+                                   "alignment score from the forward score."))
+
+    pg_foldseek.add_argument('--modernprost_model', dest='modernprost_model',
+                             default=None, metavar='HF_REPO_ID',
+                             help=("Hugging Face repo id of the ModernProst checkpoint used "
+                                   "to predict 3Di and the 12-state alphabet. Must be the "
+                                   "same checkpoint the Foldseek target DB was built with, "
+                                   "since both alphabets are model-specific. "
+                                   "Default: gbouras13/modernprost-50M-pssm"))
+
+    pg_foldseek.add_argument('--hf_cache_dir', dest="hf_cache_dir", metavar='HF_CACHE_DIR',
+                             help=("Hugging Face cache directory holding the ModernProst model. "
+                                   "Default: the 'foldseek' dir inside the eggNOG data dir."))
+
+    pg_foldseek.add_argument('--batch_size', default=20, type=int, metavar='BATCH_SIZE',
+                             help="ModernProst batch size")
+
+    pg_foldseek.add_argument('--max_batch_residues', default=50000, type=int, metavar='MAX_RESIDUES',
+                             help="ModernProst max batch residues")
+
+    pg_foldseek.add_argument('--profiles', action="store_true",
+                             help="Use modernprost-profiles for the Foldseek query DB")
+
     ##
     pg_hmmer = parser.add_argument_group('HMMER Search Options')
 
@@ -398,7 +481,7 @@ def create_arg_parser():
                                 "or after annotation, with the drop reason. Path: "
                                 "<output>.emapper.dropped. Reasons: error_seed (seed name '-' "
                                 "or 'ERROR'), evalue_above_threshold, score_below_threshold, "
-                                "non_integer_seed_id, no_donor_orthologs (engine returned no "
+                                "unresolvable_seed_id, no_donor_orthologs (engine returned no "
                                 "annotations under the active filters)."))
 
     pg_annot.add_argument(
@@ -556,7 +639,10 @@ def parse_args(parser):
             parser.error('"--training_file must point to an existing file, if no --training_genome is provided."')
     
     # Search modes
-    if args.mode == SEARCH_MODE_DIAMOND:
+    if args.mode not in ALL_SEARCH_MODES:
+        parser.error(f'unrecognized search mode (-m {args.mode})')
+
+    if args.mode in DIAMOND_MODES:
         dmnd_db = get_eggnog_dmnd_db(args.dmnd_db, args.mode, get_data_path())
         if not pexists(dmnd_db):
             print(colorify('DIAMOND database %s not present. Use download_eggnog_data.py to fetch it' % dmnd_db, 'red'))
@@ -568,8 +654,10 @@ def parse_args(parser):
                 args.annotate_hits_table = None
         else:
             # the default -m is diamond, but we will consider -m no_search as default when
-            # --annotate_hits_table has been provided and -i has not been provided
-            if args.annotate_hits_table is not None:
+            # --annotate_hits_table has been provided and -i has not been provided.
+            # Only for plain diamond: diamond-foldseek was asked for explicitly
+            # and its Foldseek pass needs the input sequences.
+            if args.annotate_hits_table is not None and args.mode == SEARCH_MODE_DIAMOND:
                 print(colorify(f"Assuming -m {SEARCH_MODE_NO_SEARCH}", 'blue'))
                 args.mode = SEARCH_MODE_NO_SEARCH
             else:
@@ -579,8 +667,8 @@ def parse_args(parser):
         if not args.output:
             parser.error('An output project name is required (-o)')
             
-    elif args.mode == SEARCH_MODE_MMSEQS2:
-        mmseqs_db = args.mmseqs_db if args.mmseqs_db else get_eggnog_mmseqs_db()
+    elif args.mode in MMSEQS_MODES:
+        mmseqs_db = resolve_mmseqs_db(args.mmseqs_db, args.gpu)
         if not pexists(mmseqs_db):
             print(colorify('MMseqs2 database %s not present. Use download_eggnog_data.py to fetch it' % mmseqs_db, 'red'))
             raise EmapperException()
@@ -593,9 +681,21 @@ def parse_args(parser):
             parser.error('An output project name is required (-o)')
 
         if args.annotate_hits_table is not None:
-            print(colorify(f"--annotate_hits_table will be ignored, due to -m {SEARCH_MODE_MMSEQS2}", 'blue'))
+            print(colorify(f"--annotate_hits_table will be ignored, due to -m {args.mode}", 'blue'))
             args.annotate_hits_table = None
-            
+
+    elif args.mode == SEARCH_MODE_FOLDSEEK:
+        if not args.input:
+            parser.error('An input fasta file is required (-i)')
+
+        # Output file required
+        if not args.output:
+            parser.error('An output project name is required (-o)')
+
+        if args.annotate_hits_table is not None:
+            print(colorify(f"--annotate_hits_table will be ignored, due to -m {args.mode}", 'blue'))
+            args.annotate_hits_table = None
+
     elif args.mode == SEARCH_MODE_HMMER:
         
         if not args.input:
@@ -628,11 +728,25 @@ def parse_args(parser):
         if args.no_annot == False and not args.annotate_hits_table:
             parser.error(f'No search mode (-m {SEARCH_MODE_NO_SEARCH}) requires a hits table to annotate (--annotate_hits_table FILE.seed_orthologs)')
         if args.md5 == True and args.input is None:
-            parser.error(f'--md5 requires an input FASTA file (-i FASTA).')            
-            
-    else:
-        parser.error(f'unrecognized search mode (-m {args.mode})')
+            parser.error(f'--md5 requires an input FASTA file (-i FASTA).')
 
+    # Foldseek checks apply to -m foldseek and to both two-stage *-foldseek
+    # modes, whose first pass was validated by the branches above.
+    if args.mode in FOLDSEEK_MODES:
+        foldseek_db = resolve_foldseek_db(args.foldseek_db, args.gpu,
+                                          args.foldseek_cluster_db)
+        if not pexists(foldseek_db):
+            print(colorify('Foldseek database %s not present. See the Foldseek section '
+                           'of the README to build it' % foldseek_db, 'red'))
+            raise EmapperException()
+
+        # The two-stage modes diff query names against the input FASTA headers to
+        # find the unannotated queries. With gene prediction the search stage
+        # renames queries (contig_0, contig_1, ...), so that diff is meaningless.
+        if args.mode != SEARCH_MODE_FOLDSEEK and args.itype in (ITYPE_GENOME, ITYPE_META):
+            parser.error(f'-m {args.mode} requires --itype {ITYPE_PROTS} or {ITYPE_CDS}. '
+                         f'For genome/metagenome input run -m {SEARCH_MODE_FOLDSEEK} '
+                         f'on its own instead.')
 
     # Search thresholds
     args.dmnd_evalue = args.mmseqs_evalue = args.hmm_evalue = args.evalue

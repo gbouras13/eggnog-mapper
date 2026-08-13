@@ -220,25 +220,33 @@ def annotate_batch(
             yield ((hit, None), False)
             continue
 
-        # v7: DIAMOND/MMseqs emit integer protein IDs as strings.
+        # v7 target DBs name their sequences by integer protein ID, so the seed
+        # arrives as a string of digits. Databases built from eggNOG v5 name
+        # sequences "TAXID.PROTEIN" instead; resolve those through
+        # protein_names rather than dropping the hit.
         try:
             seed_id = int(best_hit_name)
         except ValueError:
-            logger.warning(
-                "Cannot parse integer seed ID from '%s'; skipping hit"
-                " (DB version mismatch?)",
-                best_hit_name,
-            )
-            if dropped_writer is not None:
-                dropped_writer(
-                    query_name,
-                    "non_integer_seed_id",
+            seed_id = None
+            resolver = getattr(eggnog_db, "get_protein_id", None)
+            if resolver is not None:
+                seed_id = resolver(best_hit_name)
+            if seed_id is None:
+                logger.warning(
+                    "Seed '%s' is neither an integer protein ID nor a name in"
+                    " protein_names; skipping hit (DB version mismatch?)",
                     best_hit_name,
-                    best_hit_evalue,
-                    best_hit_score,
                 )
-            yield ((hit, None), False)
-            continue
+                if dropped_writer is not None:
+                    dropped_writer(
+                        query_name,
+                        "unresolvable_seed_id",
+                        best_hit_name,
+                        best_hit_evalue,
+                        best_hit_score,
+                    )
+                yield ((hit, None), False)
+                continue
 
         valid_hits.append((hit, query_name, seed_id, best_hit_evalue, best_hit_score))
 

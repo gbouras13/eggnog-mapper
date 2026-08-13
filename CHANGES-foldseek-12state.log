@@ -1,0 +1,274 @@
+Commits on top of upstream eggnog-mapper main @ 6ab05b3
+("docs: add beta warning to README")
+
+=== f4dc9f7 feat: merge Foldseek structural search modes onto v3
+
+Ports the eggnog-mapper-foldseek fork (gbouras13, based on v2.1.13) onto
+v3.0.0-beta2. The fork had no common history with this repo, so its
+snapshot is grafted onto the v2.1.13 commit (8abf461) as a second parent
+to give future merges a real merge base.
+
+New:
+- eggnogmapper/search/foldseek/: ModernProst 3Di inference (inference.py,
+  profiles.py), Foldseek DB creation (create_fs_db.py), the searcher
+  (foldseek.py) and the no-hit FASTA helpers (filter.py).
+- Search modes foldseek, diamond-foldseek, mmseqs-foldseek.
+- --gpu for the MMseqs2/Foldseek GPU prefilter.
+
+Adapted to v3 rather than copied:
+- Tools resolve through shutil.which + require_tool(); no LOCAL_* paths,
+  since v3 dropped the vendored eggnogmapper/bin/ binaries.
+- output_seeds() lost its outfmt_short argument.
+- run_generator() keeps its (n, total_time) contract; the annotated query
+  ids are collected through a new collect_ids set instead. The fork's
+  key_fn=lambda x: x[0] scooped whole hit rows into the set, since items
+  are (hit, annotation) pairs.
+- Emapper.run() (renamed from run_full_pipeline) drives the second stage,
+  and annotate() now returns (annotated_hits, _resumed_ref).
+- The Foldseek stage output files are registered in _output_files, so
+  --override/--resume and the scratch-dir copy handle them.
+- The second stage no longer passes the predictor to search(), which
+  would have discarded the filtered FASTA, and no longer renames the
+  gene-prediction outputs that wrap_up() moves.
+- The two-stage modes now require --itype proteins/CDS: they diff query
+  names against the input FASTA, which gene prediction invalidates.
+- FoldseekSearcher is imported lazily so torch/transformers stay an
+  optional extra rather than a hard dependency of every run.
+- .gitignore: '*old*' matched "f-old-seek" and ignored the whole package.
+
+Not carried over: the fork's vendored binaries (v3 removed them),
+container/setonix/Dockerfile (site-specific, installs from the fork with
+a token) — Foldseek was added to apptainer/eggnog-mapper.def instead.
+
+=== d2b9b88 feat(foldseek): 12-state alphabet support, switch to modernprost-50M-pssm
+
+Adapts the Foldseek integration to the Foldseek build in
+fs-dev/foldseek_retry_newref, which adds a 12-state structural alphabet
+next to 3Di, and switches 3Di/12st prediction to
+gbouras13/modernprost-50M-pssm.
+
+Model:
+- ModernProst3Di12StModel returns logits as a dict
+  {"3di": (B,L,20), "12st": (B,L,12)}, so one forward pass yields both
+  alphabets. split_logits() handles that and still accepts a plain
+  tensor (3Di only) from single-head checkpoints.
+- One checkpoint now serves both the discrete and the --profiles paths,
+  replacing modernprost-base and modernprost-profiles. Their hardcoded
+  HF blob MD5 tables are gone; check_model_download() just verifies a
+  usable snapshot is cached and lets huggingface_hub do integrity.
+- inference.py writes input_12st.fasta beside input_3di.fasta and
+  returns both paths.
+
+Database encoding:
+- Foldseek packs both alphabets into one byte per residue,
+  3Di_state * 12 + 12st_state, and flags _ss with
+  DBTYPE_EXTENDED_3DI_12ST (32) in the high half of the dbtype
+  (_ss.dbtype reads [0,0,32,0]). Alphabet orders are those of
+  data/mat3di.out (ACDEFGHIKLMNPQRSTVWY, X=20 for masked) and
+  data/mat12st.out (ACDEFGHIKLMN, no X).
+- `foldseek tsv2db` cannot produce this: the packed bytes span 0..251 and
+  would collide with TAB/NUL/newline in a TSV, and --output-dbtype cannot
+  set the extended bit. write_packed_ss_db() writes the data/index/dbtype
+  files directly instead, entries as <bytes> + '\n' + '\0'.
+- Verified byte-for-byte against an _ss database Foldseek itself built
+  from PDB structures, and end to end with the real model and binary:
+  6 globins from sequence each recover their own structure as top hit,
+  with self-hit bitscores ~30% above 3Di alone (726 -> 964 etc.).
+
+Search:
+- --ss_12st (default 1) maps to Foldseek's --ss-12st, which the search
+  workflow forwards to --aux-score, covering prefilter and alignment.
+- A packed query against a target DB without the 12 states is not an
+  error: Foldseek falls back to 3Di-only scoring and returns exactly the
+  --ss_12st 0 results. That would make the flag look effective while
+  changing nothing, so db_has_12st() inspects <target>_ss.dbtype and
+  warns, pointing at `foldseek add12st`.
+- --profiles writes _ss as an MMseqs PSSM db (dbtype 2), which has no
+  room for the packed byte, so it forces --ss_12st 0.
+
+Also fixes an f-string with nested double quotes in the --profiles path,
+which was a SyntaxError on the Python 3.9-3.11 that setup.cfg allows.
+
+=== ab4664a docs: add conda environment spec for the Foldseek/ModernProst stack
+
+environment-foldseek.yml builds an environment that can run the Foldseek
+search modes end to end, inference included: eggnog-mapper's core deps,
+the search backends (diamond, mmseqs2, hmmer, prodigal - all have
+linux-aarch64 builds), cython for the annotator extensions, and
+torch/transformers via pip.
+
+torch is left to pip because the wheel index depends on platform and
+CUDA version; the file defaults to the CUDA 13 index and documents the
+cu128/cpu alternatives. Verified on aarch64 + NVIDIA GB10 (sm_121) with
+torch 2.13.0+cu130, transformers 5.14.1, python 3.12.
+
+foldseek is deliberately not a dependency: bioconda's build has no
+--ss-12st, so a 12-state-capable build has to be put on PATH separately
+(or --ss_12st 0 used). Noted in the file and in USAGE.md.
+
+=== e5dbfb9 feat: allow annotation against a converted eggNOG v5 database
+
+The v7 database v3 requires is not published (downloads.eggnogdb.org
+carries only emapperdb-5.0.2, and no version has the manifest.json the
+downloader now demands). This makes a v5 set usable for annotation.
+
+scripts/v5_to_v7_db.py rewrites a v5 eggnog.db into the v7 core schema:
+  og            -> ogs        (name kept as "cluster@taxid")
+  event         -> sp_events  (CSV-of-names sides -> delta-varint id BLOBs)
+  prots.name    -> protein_names + integer-keyed prots
+  prots.orthoindex -> event_index
+  ref_terms is created empty (get_ref_term has no callers).
+
+Two v7 columns have no v5 source. sp_overlap is computed faithfully as the
+species-set Jaccard of the two sides. ev_lca is computed as the deepest
+common ancestor of the event's species via LineageCache when --taxa-db is
+given, else falls back to the v5 event level. Note taxa.db stores `track`
+leaf->root, contrary to LineageCache.tracks()' docstring.
+
+Two code changes were needed for v5-derived data:
+
+- Seed IDs: v7 target DBs name sequences by integer protein ID, v5 ones by
+  "TAXID.PROTEIN". batch_annotate now resolves a non-integer seed through
+  protein_names (new AnnotDB.get_protein_id, the inverse of the existing
+  get_protein_name) instead of dropping it. The drop reason for a seed that
+  resolves neither way is renamed non_integer_seed_id ->
+  unresolvable_seed_id.
+
+- OG names: _parse_ogs_string required the v7 "cluster@taxid|clade" form and
+  silently skipped v5's "cluster@taxid", leaving eggNOG_OGs, max_annot_lvl,
+  COG_category and Description empty. It now accepts both. v7 parsing is
+  unchanged (verified against 1-, 2- and 3-part names).
+
+Verified end to end on the v5 fixture DB: 2/2 queries annotated, 0 dropped,
+14-17 of 25 columns populated, and the calls are correct - ychF/COG0012
+GTPase with MMR_HSR1+YchF-GTPase_C, and E. coli polB/COG0417 with
+EC 2.7.7.7 and ko:K02336.
+
+This is v3's annotation logic over v5-derived data, not equivalent to
+eggnog-mapper 2.x on the same DB; v3 filters donors by ev_lca ceiling and
+sp_overlap, which v5 does not store authoritatively. Documented in USAGE.md.
+
+=== 0c4882a feat(foldseek): selectable ModernProst checkpoint; fixes for large query sets
+
+Preparation for running -m foldseek over a 404k-protein query set.
+
+--modernprost_model selects the checkpoint used to predict 3Di and the
+12-state alphabet (default gbouras13/modernprost-50M-pssm). Both alphabets
+are model-specific, so the target DB and the queries searched against it
+must use the same checkpoint; the help text says so.
+
+Stop retaining the (L, 20) per-position distribution unless --profiles will
+actually consume it. It was held for every query while only the PSSM path
+reads it: 6.2 GB for an 83.7M-residue input. Measured peak RSS is now
+1.41 GB for a 3k-protein slice of that set.
+
+Strip trailing stop codons via a new clean_aa_sequence(), applied both to
+the ModernProst input and to the amino-acid database in create_fs_db, which
+is what keeps the AA, 3Di and 12-state strings the same length for a query.
+'*' has no token, so terminal stops were becoming <unk> - an
+out-of-distribution token producing a junk state at the C-terminus of 39% of
+the queries at hand (157,771 of 404,085 sequences end in '*'; none have
+internal stops). An internal '*' becomes X, preserving the residue count.
+
+Throughput on the GB10 with the 50M checkpoint: 118 seq/s, ~24k residues/s,
+i.e. ~57 min for the full 404k set.
+
+Also ignore eggnongdb/, the local eggNOG download directory.
+
+=== 5931ab2 perf(v5->v7): set-based LCA and bounded memory for a full-size v5 database
+
+Sized against the real emapperdb-5.0.2: 23.7M proteins, 4.4M OGs and 75.4M
+events (38 GB), versus 19k/27/504 in the test fixture.
+
+Two things did not scale:
+
+- event_index built a `kept` set of every surviving event id, i.e. a 75M
+  element Python set (~4 GB). It now records only the rejects, which on a
+  complete v5 DB is near-empty since every member name is in prots.
+
+- ev_lca walked ordered lineage tracks pairwise per event. Sampling across
+  the id range gives ~8 members and ~8 species per event, so that walk would
+  have dominated the entire conversion. Replaced with an ancestor-set
+  intersection plus a depth lookup, which runs in C, and memoised on the
+  species set. Verified to produce byte-identical ev_lca values to the
+  pairwise version on the fixture (504/504 events).
+
+=== 77bf67d feat(foldseek): 12-state channel for PSSM profile queries
+
+--profiles no longer forces --ss_12st 0. Foldseek supports the 12-state
+alphabet for profile queries in a different on-disk form than for discrete
+ones: instead of packing it into the _ss byte, it reads a sibling
+<querydb>_ss12 database, and accepts that being a DBTYPE_HMM_PROFILE
+(structurealign.cpp: queryHas12St = query3Di12St || (q12StDbr != NULL),
+query12StProfileLayout). This writes that database from the model's 12-state
+head.
+
+- computeLogPSSM takes a background-frequency vector; BACKPROBS_12ST holds
+  the 12-state background from Foldseek's data/mat12st.out.
+- toBuffer_pssm_states packs an n-state PSSM into MMseqs' fixed 25-byte
+  records (PROFILE_AA_SIZE 20 + 5), padding the unused score slots with -128
+  so they can never be selected. Verified byte-identical to toBuffer_pssm for
+  the 20-state 3Di case.
+- Foldseek indexes a profile-layout 12-state matrix by amino-acid slot
+  (subMatAA.aa2num[rowLetter]), not by 12-state index. No remapping is needed
+  because mat12st.out and the AA matrix share the same letter order, so the
+  12 states A C D E F G H I K L M N are AA slots 0..11.
+- The 12-state distribution is only softmaxed and retained when --profiles
+  needs it, so the discrete path keeps its bounded memory.
+
+Verified against the real binary. With the _ss12 profile DB present,
+--ss-12st 1 raises self-hit bitscores well above 3Di-only (e.g. 1139 -> 1633,
+1178 -> 1681). Negative control: with _ss12 removed, --ss-12st 1 reproduces
+the 3Di-only scores exactly, so the gain is attributable to this database and
+not to some other flag effect.
+
+=== eead171 fix(foldseek): match E-value calibration to 12-state scoring
+
+Foldseek defaults to --evalue-nn-mode 0, the 3Di-only whole-query composition
+network. Every search so far scored *with* the 12-state channel enabled while
+calibrating E-values *without* it, which inflates significance badly. Mode 2 is
+the 3Di+12-state network and requires a 12-state query, which --ss_12st
+already guarantees, so it is now selected automatically whenever --ss_12st is
+on. --evalue_nn_mode overrides.
+
+Measured on 203 profile queries vs the 100k 12-state target DB: bitscores are
+identical between modes (202/202, the network only affects calibration), while
+E-values move by a median factor of 1.4e5 - median 2.51e-16 -> 2.98e-12, and
+the fraction passing e<1e-3 drops from 100% to 94%.
+
+Also exposed:
+- --evalue_12st_profile_comp, Foldseek's --evalue-12st-profile-comp, which
+  chooses where the mode-2 network takes the query composition from for
+  profile queries (0 center/query sequence, 1 recover from profile scores).
+- --use_reverse_score, default 1 matching Foldseek's own default, now emitted
+  explicitly so the command line records it instead of relying on the build.
+
+This is calibration only. It does not address the separate score-magnitude
+problem: the 12-state PSSM is emitted on the 3Di bit-scale, giving the aligner
+~9.2 per confident position against mat12st.out's diagonal of 1.9-4.3
+(median 2.6). Bitscores are untouched by the NN mode, so that remains open.
+
+=== 8805e98 fix(gitignore): stop "*old*" silently ignoring every foldseek-named path
+
+".gitignore" carries "*old*", which matches "f-old-seek". An earlier commit
+negated it only for eggnogmapper/search/foldseek/, so every *other*
+foldseek-named file added since was silently dropped by "git add". Commit
+ab4664a is the visible casualty: its message says it adds
+environment-foldseek.yml, but the commit contains only the USAGE.md change
+because the YAML was ignored.
+
+Replaced with a general "!*foldseek*" negation placed after "*old*".
+Verified that foo_old.py and bar.old.txt are still ignored.
+
+Adds the files that had been dropped or were pending:
+  environment-foldseek.yml          (should have landed in ab4664a)
+  HANDOVER-foldseek-12state.md      handover for a collaborator
+  scripts/build-foldseek-db.py      build a 12-state Foldseek target DB
+  scripts/example-foldseek-runs.sh  the three-configuration comparison driver
+
+=== 86ba841 chore(gitignore): keep HF model caches out of tracking
+
+The new !*foldseek* negation also un-ignored tests/fixtures/foldseek/, which is
+a 201 MB Hugging Face model cache created by running with --data_dir
+tests/fixtures. Exclude it, and any models--* cache dir, explicitly.
+

@@ -9,7 +9,8 @@ from sys import stderr as sys_stderr
 from tempfile import mkdtemp, mkstemp
 import uuid
 
-from ...common import MMSEQS2, get_eggnog_mmseqs_db, ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META
+from ...common import MMSEQS2, resolve_mmseqs_db, \
+    ITYPE_CDS, ITYPE_PROTS, ITYPE_GENOME, ITYPE_META
 from ...emapperException import EmapperException
 from ...utils import colorify, translate_cds_to_prots
 
@@ -79,7 +80,10 @@ class MMseqs2Searcher:
         self.allow_overlaps = args.allow_overlaps
         self.overlap_tol = args.overlap_tol
 
-        self.targetdb = args.mmseqs_db if args.mmseqs_db else get_eggnog_mmseqs_db()
+        # --gpu selects the GPU-padded target DB; an explicit --mmseqs_db wins.
+        self.gpu = getattr(args, 'gpu', False)
+        self.targetdb = resolve_mmseqs_db(args.mmseqs_db, self.gpu)
+
         self.cpu = args.cpu
         self.start_sens = args.start_sens
         self.sens_steps = args.sens_steps
@@ -225,9 +229,15 @@ class MMseqs2Searcher:
         # mmseqs search queryDB targetDB resultDB tmp
         cmd = (
             f'{MMSEQS2} search -a true \'{querydb}\' \'{targetdb}\' \'{resultdb}\' \'{self.temp_dir}\' '
-            f'--start-sens {self.start_sens} --sens-steps {self.sens_steps} -s {self.final_sens} '
             f'--threads {self.cpu}'
         )
+
+        if self.gpu:
+            # GPU prefilter ignores the sensitivity ladder
+            cmd += ' --gpu 1 --prefilter-mode 1'
+        else:
+            cmd += (f' --start-sens {self.start_sens} --sens-steps {self.sens_steps} '
+                    f'-s {self.final_sens}')
 
         if self.sub_mat is not None: cmd += f' --sub-mat {self.sub_mat}'
         if self.translation_table is not None: cmd += f' --translation-table {self.translation_table}'

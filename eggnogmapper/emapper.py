@@ -14,8 +14,10 @@ from .emapperException import EmapperException
 
 from .genepred.genepred_modes import GENEPRED_MODE_SEARCH, GENEPRED_MODE_PRODIGAL, get_predictor
 from .genepred.util import create_prots_file
-from .search.search_modes import get_searcher, SEARCH_MODE_NO_SEARCH
+from .search.search_modes import get_searcher, SEARCH_MODE_NO_SEARCH, \
+    SEARCH_MODE_FOLDSEEK, SEARCH_MODE_DIAMOND_FOLDSEEK, SEARCH_MODE_MMSEQS2_FOLDSEEK
 from .search.hits_io import parse_seeds
+from .search.foldseek.filter import get_all_protein_ids, write_no_hit_fasta
 from .annotation.annotator import Annotator
 from .deco.decoration import run_gff_decoration, DECORATE_GFF_NONE, create_blastx_hits_gff
 
@@ -56,6 +58,15 @@ class Emapper:
         self.dropped_file = f"{prefix}.emapper.dropped"
         self.deco_gff_file = f"{prefix}.emapper.decorated.gff"
 
+        # Two-stage *-foldseek modes: after the DIAMOND/MMseqs2 pass, a second
+        # Foldseek pass runs over the still-unannotated queries and writes its
+        # own set of output files under this prefix. See
+        # _switch_to_foldseek_stage().
+        self.is_two_stage_foldseek = mode in (SEARCH_MODE_DIAMOND_FOLDSEEK,
+                                              SEARCH_MODE_MMSEQS2_FOLDSEEK)
+        self.foldseek_prefix = f"{prefix}.foldseek.extra"
+        self.foldseek_no_hits_file = f"{prefix}.emapper.no_hits.fasta"
+
         self.genepred = genepred
         self.mode = mode
         
@@ -88,6 +99,19 @@ class Emapper:
         else:
             self._output_files.extend([self.search_out_file, self.seed_orthologs_file,
                                        self.annot_file, self.pfam_file])
+
+        # Register the Foldseek pass outputs too, so that --override/--resume
+        # and the scratch-dir copy in wrap_up() treat them like any other output.
+        if self.is_two_stage_foldseek:
+            fp = self.foldseek_prefix
+            self._output_files.extend([
+                self.foldseek_no_hits_file,
+                f"{fp}.emapper.hits",
+                f"{fp}.emapper.seed_orthologs",
+            ])
+            if annot == True:
+                self._output_files.extend([f"{fp}.emapper.annotations",
+                                           f"{fp}.emapper.pfam"])
 
         if annot == True and excel == True:
             self._output_files.append(self.excel_file)
@@ -262,6 +286,48 @@ class Emapper:
 
 
     ##
+    def _switch_to_foldseek_stage(self):
+        """Point the output-file attributes at the Foldseek pass, and switch
+        self.mode so that search() builds a FoldseekSearcher."""
+        prefix = self.foldseek_prefix
+
+        # genepred_fasta_file / genepred_gff_file are deliberately left alone:
+        # gene prediction ran once for the whole run, and wrap_up() moves the
+        # predictor output to those names.
+        self.search_out_file = f"{prefix}.emapper.hits"
+        self.seed_orthologs_file = f"{prefix}.emapper.seed_orthologs"
+        self.annot_file = f"{prefix}.emapper.annotations"
+        self.no_annot_file = f"{prefix}.emapper.no_annotations.fasta"
+        self.orthologs_file = f"{prefix}.emapper.orthologs"
+        self.pfam_file = f"{prefix}.emapper.pfam"
+        self.excel_file = f"{prefix}.emapper.annotations.xlsx"
+        self.dropped_file = f"{prefix}.emapper.dropped"
+        self.deco_gff_file = f"{prefix}.emapper.decorated.gff"
+
+        self.mode = SEARCH_MODE_FOLDSEEK
+
+        return
+
+    ##
+    def filter_infile(self, infile, annotated_ids):
+        """Write a FASTA of the queries in infile that got no annotation.
+
+        Returns the path of that FASTA, to be used as input for the Foldseek
+        pass of the two-stage *-foldseek modes.
+        """
+        all_input_ids = get_all_protein_ids(infile)
+        no_hit_ids = all_input_ids - annotated_ids
+
+        no_hit_fasta = pjoin(self._current_dir, self.foldseek_no_hits_file)
+        write_no_hit_fasta(infile, no_hit_fasta, no_hit_ids)
+
+        print(colorify(f"{len(no_hit_ids)} of {len(all_input_ids)} queries "
+                       f"were left unannotated; running Foldseek on them.", 'lgreen'),
+              file=stderr)
+
+        return no_hit_fasta
+
+    ##
     def _print_progress(self, n, n_new, start_time, mem_monitor):
         total_time = time.time() - start_time
         percen_mem = psutil.virtual_memory().percent
@@ -283,7 +349,25 @@ class Emapper:
         return total_time
 
     ##
-    def run_generator(self, generator, resumed_ref=None, CHUNK_SIZE=500, mem_monitor=True):
+    @staticmethod
+    def _item_query_name(item):
+        """Query name of an item yielded by the annotation/decoration chain.
+
+        Those generators yield (hit, annotation) pairs, where hit[0] is the
+        query name. Kept tolerant so a bare hit list also works.
+        """
+        hit = item[0] if isinstance(item, tuple) else item
+        return hit[0] if isinstance(hit, (list, tuple)) else hit
+
+    ##
+    def run_generator(self, generator, resumed_ref=None, CHUNK_SIZE=500, mem_monitor=True,
+                      collect_ids=None):
+        """Drain the annotation generator, reporting progress.
+
+        collect_ids: optional set, filled with the query name of every item
+        consumed. Used by the two-stage *-foldseek modes to work out which
+        queries still have no annotation.
+        """
 
         n = 0
         start_time = time.time()
@@ -294,6 +378,8 @@ class Emapper:
 
         for item in generator:
             n += 1
+            if collect_ids is not None:
+                collect_ids.add(self._item_query_name(item))
             if n % CHUNK_SIZE == 0:
                 n_new = n - _n_skipped[0]
                 self._print_progress(n, n_new, start_time, mem_monitor)
@@ -370,7 +456,44 @@ class Emapper:
 
             ##
             # Run the generators
-            n, elapsed_time = self.run_generator(annotated_hits, _resumed_ref)
+            annotated_ids = set() if self.is_two_stage_foldseek else None
+            n, elapsed_time = self.run_generator(annotated_hits, _resumed_ref,
+                                                 collect_ids=annotated_ids)
+
+            ##
+            # Two-stage *-foldseek modes: re-run steps 1-3 with Foldseek over
+            # the queries the first pass left unannotated.
+            if self.is_two_stage_foldseek:
+                # the first-pass searcher is done with; release its temp dir
+                # before wrap_up() only ever sees the Foldseek one
+                if searcher is not None:
+                    searcher.clear()
+                    searcher = None
+
+                self._switch_to_foldseek_stage()
+                foldseek_infile = self.filter_infile(infile, annotated_ids)
+
+                # Step 1. Sequence search. No predictor: search() would use
+                # predictor.outprots and ignore our filtered FASTA. Gene
+                # prediction already ran in the first pass, and the filtered
+                # FASTA holds the predicted proteins that stayed unannotated.
+                searcher, searcher_name, hits, queries_file = self.search(
+                    args, foldseek_infile, None)
+
+                # Step 2. Annotation. annotate_hits_table is deliberately not
+                # reused: it belongs to the first pass, and re-reading it here
+                # would annotate the whole table a second time.
+                annotated_hits, _resumed_ref = self.annotate(
+                    args, hits, None, queries_file)
+
+                # Step 3. Decorate GFF
+                annotated_hits = self.decorate_gff_f(args, predictor, searcher_name,
+                                                     annotated_hits)
+
+                # Run the generators. elapsed_time is deliberately not summed:
+                # the caller reports wall-clock time for the whole run.
+                n_foldseek, _ = self.run_generator(annotated_hits, _resumed_ref)
+                n += n_foldseek
 
             ##
             # Finish

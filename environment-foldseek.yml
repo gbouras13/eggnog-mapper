@@ -1,0 +1,53 @@
+# Conda environment for the eggnog-mapper Foldseek search modes, including the
+# ModernProst 3Di + 12-state inference step.
+#
+#   conda env create -f environment-foldseek.yml     # or micromamba/mamba
+#   conda activate eggnog-foldseek
+#   pip install .                                    # eggnog-mapper itself
+#
+# GPU note: torch is installed via pip below, because the wheel index differs
+# per platform and CUDA version. The pip line here pulls CUDA 13 builds, which
+# is what an aarch64 + Blackwell (e.g. GB10, sm_121) host needs. Adjust the
+# --index-url for your hardware:
+#   CUDA 13     https://download.pytorch.org/whl/cu130
+#   CUDA 12.8   https://download.pytorch.org/whl/cu128
+#   CPU only    https://download.pytorch.org/whl/cpu
+#
+# Foldseek note: the 12-state alphabet (--ss-12st) needs a Foldseek build that
+# supports it. Bioconda's foldseek does not yet, so it is deliberately NOT
+# listed here - put your own 12-state-capable build on PATH, e.g.
+#   ln -s /path/to/foldseek $CONDA_PREFIX/bin/foldseek
+# Use `--ss_12st 0` if you only have an older Foldseek.
+name: eggnog-foldseek
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - pip
+
+  # eggnog-mapper core
+  - biopython>=1.79
+  - psutil>=5.7.0
+  - xlsxwriter>=1.4.3
+
+  # builds the optional Cython extensions in eggnogmapper.annotator
+  - cython>=3.0
+
+  # search backends / gene prediction (all have linux-aarch64 builds)
+  - diamond
+  - mmseqs2
+  - hmmer
+  - prodigal
+
+  # ModernProst inference
+  - numpy>=1.21
+  - tqdm>=4.60
+
+  - pytest
+
+  - pip:
+      - --index-url https://download.pytorch.org/whl/cu130
+      - --extra-index-url https://pypi.org/simple
+      - torch>=2.0,<3.0
+      - transformers>=4.34.0

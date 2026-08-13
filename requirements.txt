@@ -1,3 +1,10 @@
 biopython==1.76
 psutil==5.7.0
 xlsxwriter==1.4.3
+
+# Foldseek search modes only (-m foldseek / diamond-foldseek / mmseqs-foldseek).
+# Equivalent to: pip install eggnog-mapper[foldseek]
+# torch>=2.0,<3.0
+# transformers>=4.34.0
+# tqdm>=4.60
+# numpy>=1.21

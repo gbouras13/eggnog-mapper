@@ -61,6 +61,7 @@ HMMPRESS = shutil.which('hmmpress')
 ESL_REFORMAT = shutil.which('esl-reformat')
 DIAMOND = shutil.which('diamond')
 MMSEQS2 = shutil.which('mmseqs')
+FOLDSEEK = shutil.which('foldseek')
 PRODIGAL = shutil.which('prodigal')
 
 
@@ -88,6 +89,41 @@ def get_novel_fams_db_file(): return pjoin(DATA_PATH, "novel_fams.pkl")
 def get_ncbitaxadb_file(): return pjoin(DATA_PATH, "eggnog.taxa.db")
 def get_eggnog_mmseqs_dbpath(): return pjoin(DATA_PATH, "mmseqs")
 def get_eggnog_mmseqs_db(): return pjoin(DATA_PATH, "mmseqs", "mmseqs.db")
+# GPU-padded MMseqs2 DB, built with:
+#   mmseqs makepaddedseqdb mmseqs.db mmseqs.db.gpu --threads 16
+def get_eggnog_mmseqs_db_gpu(): return pjoin(DATA_PATH, "mmseqs", "mmseqs.db.gpu")
+def get_eggnog_foldseek_dbpath(): return pjoin(DATA_PATH, "foldseek")
+def get_eggnog_foldseek_db(): return pjoin(DATA_PATH, "foldseek", "foldseek.db")
+# GPU-padded Foldseek DBs, built with:
+#   foldseek makepaddedseqdb foldseek.db foldseek.db.gpu --threads 16
+#   foldseek makepaddedseqdb foldseek.db.clustered.searchDB \
+#       foldseek.db.clustered.searchDB.gpu --threads 16 --cluster-search 1
+def get_eggnog_foldseek_db_gpu(): return pjoin(DATA_PATH, "foldseek", "foldseek.db.gpu")
+def get_eggnog_foldseek_cluster_db(): return pjoin(DATA_PATH, "foldseek", "foldseek.db.clustered.searchDB")
+def get_eggnog_foldseek_cluster_db_gpu(): return pjoin(DATA_PATH, "foldseek", "foldseek.db.clustered.searchDB.gpu")
+# Hugging Face cache for the ModernProst / ProstT5 3Di inference model
+def get_hf_cache_dir(): return pjoin(DATA_PATH, "foldseek")
+
+
+def resolve_mmseqs_db(mmseqs_db=None, gpu=False):
+    """MMseqs2 target DB implied by the CLI options. An explicit --mmseqs_db wins."""
+    if mmseqs_db:
+        return mmseqs_db
+    return get_eggnog_mmseqs_db_gpu() if gpu else get_eggnog_mmseqs_db()
+
+
+def resolve_foldseek_db(foldseek_db=None, gpu=False, cluster_db=False):
+    """Foldseek target DB implied by the CLI options.
+
+    --foldseek_cluster_db takes precedence, since the clustered DB has its own
+    fixed layout. Used by both the CLI pre-flight check and FoldseekSearcher so
+    the two cannot disagree.
+    """
+    if cluster_db:
+        return get_eggnog_foldseek_cluster_db_gpu() if gpu else get_eggnog_foldseek_cluster_db()
+    if foldseek_db:
+        return foldseek_db
+    return get_eggnog_foldseek_db_gpu() if gpu else get_eggnog_foldseek_db()
 def get_pfam_dbpath(): return pjoin(DATA_PATH, "pfam")
 def get_pfam_db(): return pjoin(DATA_PATH, "pfam", "Pfam-A.hmm")
 def get_pfam_clans_file(): return pjoin(DATA_PATH, "pfam", "Pfam-A.clans.tsv.gz")

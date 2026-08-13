@@ -1582,12 +1582,19 @@ class AnnotationEngine:
             if len(parts) >= 2:
                 # og_name is first two parts: cluster@taxid|clade
                 og_name = "|".join(parts[:2])
-                # level is the taxid part from cluster@taxid
-                if "@" in parts[0]:
-                    level = parts[0].split("@")[1]
-                else:
-                    level = "-"
-                result.append((og_name, level))
+            elif "@" in og:
+                # eggNOG v5 style "cluster@taxid", with no |clade component.
+                # Databases converted from v5 keep that form in both prots.ogs
+                # and ogs.name, so use it verbatim as the lookup key.
+                og_name = og
+            else:
+                continue
+            # level is the taxid part from cluster@taxid
+            if "@" in parts[0]:
+                level = parts[0].split("@")[1]
+            else:
+                level = "-"
+            result.append((og_name, level))
         return result
 
     def _is_informative_pname(self, pname: str) -> bool:
