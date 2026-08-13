@@ -23,9 +23,9 @@ from .create_fs_db import ALPHABET_3DI, ALPHABET_12ST, clean_aa_sequence
 # so a single forward pass yields both alphabets Foldseek needs.
 MODERNPROST_MODEL = "gbouras13/modernprost-50M-pssm"
 
-# 3Di index -> letter, with 20 ('X') reserved for masked/low-confidence positions
+# 3Di index -> letter. Only the 20 real states are ever written: eggnog-mapper
+# does not mask low-confidence positions (see write_predictions).
 SS_MAPPING = {i: c for i, c in enumerate(ALPHABET_3DI)}
-MASKED_3DI_STATE = ALPHABET_3DI.index('X')
 # 12-state index -> letter. This alphabet has no 'X'.
 ST12_MAPPING = {i: c for i, c in enumerate(ALPHABET_12ST)}
 
@@ -33,17 +33,22 @@ ST12_MAPPING = {i: c for i, c in enumerate(ALPHABET_12ST)}
 def write_predictions(
     predictions: Dict[str, Dict[str, Tuple[List[str], Any, Any]]],
     out_path: Path,
-    mask_prop_threshold: float,
     out_path_12st: Path = None
 ) -> None:
     """
     Write predictions to an output file.
 
+    Low-confidence 3Di positions are deliberately NOT masked to 'X'. Masking
+    is not meaningful for the combined 3Di + 12-state encoding: the 12-state
+    head has no masked state of its own, so a masked 3Di position would still
+    carry a confident 12-state call, and the two alphabets would disagree about
+    the same residue. It also keeps the written 3Di alphabet to the 20 real
+    states, which is what the packed encoding in create_fs_db assumes.
+
     Args:
         predictions: per-sequence tuple of
             (pred_3di, mean_prob, max_prob, all_prob, pred_12st, all_prob_12st).
         out_path (Path): Path to the 3Di output FASTA.
-        mask_threshold (float): between 0 and 100 - below this ProstT5 confidence, 3Di predictions are masked
         out_path_12st (Path): Path to the 12-state output FASTA. Skipped when the
             model did not produce a 12-state head.
 
@@ -60,13 +65,6 @@ def write_predictions(
     try:
         with open(out_path, "w") as out_f:
             for seq_id, (pred, mean_prob, max_prob, all_prob, pred12, all_prob12) in prediction_dict.items():
-                max_prob = max_prob * 100
-
-                # apply masking
-                for i in range(len(pred)):
-                    if max_prob[i] < mask_prop_threshold:
-                        pred[i] = MASKED_3DI_STATE
-
                 seq = "".join(SS_MAPPING[int(yhat)] for yhat in pred)
 
                 out_f.write(f">{seq_id}\n{seq}\n")
@@ -556,12 +554,10 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
             tsv_writer = csv.writer(file, delimiter="\t")
             tsv_writer.writerows(data_as_list_of_lists)
 
-    mask_threshold = 0 # keep as 0
-
     output_3di: Path = Path(output_dir) / "input_3di.fasta"
     output_12st: Path = Path(output_dir) / "input_12st.fasta"
 
-    write_predictions(predictions, output_3di, mask_threshold, output_12st)
+    write_predictions(predictions, output_3di, output_12st)
 
     if profiles:
 

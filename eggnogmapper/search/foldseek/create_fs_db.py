@@ -25,8 +25,11 @@ from ...utils import colorify
 # (data/mat3di.out and data/mat12st.out). The index of a letter here is the
 # numeric state Foldseek expects on disk.
 #
-# 3Di has 20 real states plus 'X' at index 20 for "invalid/masked".
-ALPHABET_3DI = "ACDEFGHIKLMNPQRSTVWYX"
+# 3Di has 20 real states. Foldseek's own structure-derived databases also use
+# 'X' at index 20 for "invalid/masked", but eggnog-mapper never writes it: it
+# does not mask low-confidence positions (see inference.write_predictions), so
+# only the 20 real states appear here.
+ALPHABET_3DI = "ACDEFGHIKLMNPQRSTVWY"
 # The 12-state alphabet has exactly 12 states and no 'X'; Foldseek uses index 6
 # ('H', Alphabet12St::INVALID_STATE) for invalid residues.
 ALPHABET_12ST = "ACDEFGHIKLMN"
@@ -35,7 +38,7 @@ INVALID_STATE_12ST = 6  # 'H'
 
 # Foldseek packs both alphabets into one byte per residue:
 #     byte = state3di * STATE_CNT_12ST + state12st
-# so values run 0..251 (3Di 'X' = 20 gives 240..251). Such an _ss database is
+# so the values we write run 0..239. Such an _ss database is
 # flagged by ORing DBTYPE_EXTENDED_3DI_12ST (32) into the high half of the
 # dbtype; the low half stays DBTYPE_AMINO_ACIDS (0).
 DBTYPE_AMINO_ACIDS = 0
@@ -67,9 +70,14 @@ def clean_aa_sequence(seq: str) -> str:
 def pack_3di_12st(seq_3di: str, seq_12st: str) -> bytes:
     """Pack a 3Di and a 12-state string into Foldseek's one-byte-per-residue form.
 
-    Unknown 12-state letters (including the 'X' Foldseek itself writes when it
-    masks a position) collapse to INVALID_STATE_12ST, because the packed byte
-    has no room for a 21st state.
+    A 3Di letter outside the 20 real states is an error rather than something to
+    fold into a masked state: eggnog-mapper does not mask, so an 'X' here means
+    the 3Di FASTA came from somewhere else (a structure-derived database, or a
+    masking-enabled predictor) and the two alphabets can no longer be trusted to
+    describe the same residue.
+
+    Unknown 12-state letters collapse to INVALID_STATE_12ST, which is Foldseek's
+    own encoding for an invalid residue in that alphabet.
     """
     if len(seq_3di) != len(seq_12st):
         raise EmapperException(
@@ -79,7 +87,15 @@ def pack_3di_12st(seq_3di: str, seq_12st: str) -> bytes:
 
     out = bytearray(len(seq_3di))
     for i, (c3, c12) in enumerate(zip(seq_3di, seq_12st)):
-        s3 = _IDX_3DI.get(c3.upper(), _IDX_3DI['X'])
+        try:
+            s3 = _IDX_3DI[c3.upper()]
+        except KeyError:
+            hint = (" — 'X' is a masked position, which eggnog-mapper does not"
+                    " produce and the packed 3Di+12-state encoding cannot"
+                    " represent" if c3.upper() == 'X' else "")
+            raise EmapperException(
+                f"Unknown 3Di character {c3!r} at position {i}{hint}."
+            ) from None
         s12 = _IDX_12ST.get(c12.upper(), INVALID_STATE_12ST)
         out[i] = s3 * STATE_CNT_12ST + s12
     return bytes(out)
