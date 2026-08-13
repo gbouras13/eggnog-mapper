@@ -40,26 +40,42 @@ jobs:
       - name: Show free disk after cleanup
         run: df -h
 
-      # Only on push. Secrets are not exposed to pull_request builds from
-      # forks, so an unconditional login turns every such PR red; a PR still
-      # gets full value from building the image without publishing it.
-      - name: Log in to Quay
-        if: github.event_name == 'push'
-        run: echo "${{ secrets.QUAY_PASSWORD }}" | docker login quay.io -u "${{ secrets.QUAY_USERNAME }}" --password-stdin
-
+      # Build BEFORE logging in. The image is worth validating even when it
+      # cannot be published -- a fork pull_request gets no secrets, and a repo
+      # that has not had QUAY_* set yet would otherwise fail at login and skip
+      # the build entirely, reporting nothing about the Dockerfile.
+      #
       # eggnog-mapper comes from the checked-out build context, so the image
       # always matches the commit that triggered it without a second fetch.
       # FOLDSEEK_REF is pinned separately: Victor-Mihaila/foldseek only has a
       # master branch, and the 12-state work lives there.
       - name: Build Docker image
         run: |
-          IMAGE=quay.io/${{ secrets.QUAY_USERNAME }}/eggnog-mapper-12st:${{ github.sha }}
           docker build \
             --build-arg FOLDSEEK_REF=master \
-            -f container/hpci/Dockerfile -t $IMAGE .
+            -f container/hpci/Dockerfile -t eggnog-mapper-12st:${{ github.sha }} .
 
-      - name: Push Docker image
+      # Publishing needs QUAY_USERNAME/QUAY_PASSWORD on *this* repo; secrets are
+      # not shared between repositories. Without them the build above still
+      # runs and this step is skipped with a notice rather than a red run.
+      - name: Check Quay credentials
+        id: quay
         if: github.event_name == 'push'
         run: |
+          if [ -n "${{ secrets.QUAY_USERNAME }}" ] && [ -n "${{ secrets.QUAY_PASSWORD }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::QUAY_USERNAME/QUAY_PASSWORD are not set on this repository; image built but not pushed."
+          fi
+
+      - name: Log in to Quay
+        if: steps.quay.outputs.available == 'true'
+        run: echo "${{ secrets.QUAY_PASSWORD }}" | docker login quay.io -u "${{ secrets.QUAY_USERNAME }}" --password-stdin
+
+      - name: Push Docker image
+        if: steps.quay.outputs.available == 'true'
+        run: |
           IMAGE=quay.io/${{ secrets.QUAY_USERNAME }}/eggnog-mapper-12st:${{ github.sha }}
+          docker tag eggnog-mapper-12st:${{ github.sha }} $IMAGE
           docker push $IMAGE
