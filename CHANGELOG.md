@@ -7,6 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--evalue` is now passed to `mmseqs search`** instead of only filtering the
+  converted m8 afterwards. MMseqs2's own `-e` defaults to 0.001, the same value
+  as emapper's `--evalue`, so the omission was invisible at the default — but a
+  *looser* threshold was silently capped there, because MMseqs2 discarded those
+  alignments internally and the post-filter never saw them. `-m mmseqs
+  --evalue 1` returned exactly the `--evalue 0.001` result set. Tighter
+  thresholds were already correct and are now applied during the search, so
+  alignments destined to be discarded are no longer computed and converted
+  first. (`-m diamond` was unaffected: DiamondSearcher has always passed `-e`.)
+- **`-m mmseqs` no longer discards a query when its top hit fails a
+  threshold.** `_parse_mmseqs` skipped a query as soon as it had *seen* it,
+  before the `--evalue` / `--score` / `--pident` / `--query_cover` /
+  `--subject_cover` checks ran, so the remaining candidates from
+  `filterdb --extract-lines` were dropped unexamined and the query produced no
+  seed ortholog even when a later candidate passed. The per-query gate now
+  keys on the last query actually emitted. Queries whose first candidate
+  already passed are unaffected, so output is unchanged wherever the top hit
+  was above threshold. (`_parse_genepred` already ordered these correctly.)
+
 ## [3.0.0-beta6] — 2026-08-12
 
 ### Removed / renamed (pre-stable CLI cleanup)

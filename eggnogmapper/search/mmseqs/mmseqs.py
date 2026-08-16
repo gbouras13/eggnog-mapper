@@ -254,6 +254,20 @@ class MMseqs2Searcher:
             f'--threads {self.cpu}'
         )
 
+        # Pass --evalue through to MMseqs2 instead of only filtering the m8
+        # afterwards (see _parse_mmseqs). MMseqs2's own -e defaults to 0.001
+        # (Parameters.cpp), which happens to equal emapper's --evalue default,
+        # so the two agreed by coincidence and the omission was invisible. Any
+        # *looser* threshold was silently capped at 0.001: MMseqs2 discarded
+        # those alignments internally and the post-filter never saw them, so
+        # e.g. `--evalue 1` returned exactly the `--evalue 0.001` result set
+        # with no warning. DiamondSearcher has always passed -e (diamond.py).
+        #
+        # Tighter thresholds behaved correctly before and still do; they are
+        # now applied during the search, so alignments destined to be dropped
+        # are not computed and converted first.
+        if self.evalue_thr is not None: cmd += f' -e {self.evalue_thr}'
+
         if self.sub_mat is not None: cmd += f' --sub-mat {self.sub_mat}'
         if self.translation_table is not None: cmd += f' --translation-table {self.translation_table}'
         
@@ -314,12 +328,26 @@ class MMseqs2Searcher:
         
                 query = fields[0]
                             
-                # only one result per query
+                # Only one result per query, keyed on the last query actually
+                # *yielded* rather than the last one seen.
+                #
+                # filterdb --extract-lines hands this parser N candidates per
+                # query. Skipping on "seen" meant that if the first candidate
+                # failed any threshold below, the remaining candidates were
+                # dropped without being examined, so the query produced no seed
+                # even when a later candidate passed. The extra candidates were
+                # still fetched, aligned and converted -- only to be discarded.
+                #
+                # They are not redundant: MMseqs2 orders hits by score, which is
+                # not strictly monotonic with E-value across targets of
+                # differing length, and --pident / --query_cover /
+                # --subject_cover are independent of the ordering entirely.
+                #
+                # _parse_genepred (below) already applied the thresholds before
+                # its per-query logic; this brings the two into agreement.
                 if prev_query is not None and query == prev_query:
                     continue
-                else:
-                    prev_query = query
-                    
+
                 pident = float(fields[2])
                 evalue = float(fields[8])
                 score = float(fields[9])
@@ -342,6 +370,7 @@ class MMseqs2Searcher:
                 send = int(fields[7])
 
                 hit = [query, target, evalue, score, qstart, qend, sstart, send, pident, qcov, scov]
+                prev_query = query
                 yield hit # hit
         return
 
