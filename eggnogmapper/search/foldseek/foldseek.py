@@ -347,8 +347,16 @@ class FoldseekSearcher:
         cmd = (
                 f'{FOLDSEEK} search -a true \'{querydb}\' \'{targetdb}\' \'{resultdb}\' \'{self.temp_dir}\' '
                 f'--threads {self.cpu} --max-seqs {foldseek_max_seqs}'
-        
+
         )
+
+        # Give Foldseek the E-value threshold instead of only filtering the m8
+        # afterwards. Foldseek's own default is 10 (it overrides MMseqs' 0.001),
+        # so without this a --evalue above 10 was silently capped there: the
+        # hits were dropped inside the search and the post-filter never saw
+        # them. Matches DiamondSearcher, which has always passed -e.
+        if self.evalue_thr is not None:
+            cmd += f' -e {self.evalue_thr} '
         if gpu:
 
             cmd += f" --gpu 1 --prefilter-mode 1 "
@@ -450,13 +458,19 @@ class FoldseekSearcher:
                 # check fields in convertalis_step()
         
                 query = fields[0]
-                            
-                # only one result per query
+
+                # One seed per query. Keyed on the last query actually
+                # *yielded*, not the last one seen: --foldseek_top_hits gives
+                # this parser N candidates per query, and if the first fails a
+                # threshold the next should be considered. Skipping on "seen"
+                # discarded the rest unexamined, so a query whose best-scoring
+                # hit failed --evalue produced no seed even when a later
+                # candidate passed. Foldseek sorts by structure bits, which is
+                # not strictly monotonic with E-value across targets of
+                # differing length, so those candidates are not redundant.
                 if prev_query is not None and query == prev_query:
                     continue
-                else:
-                    prev_query = query
-                    
+
                 pident = float(fields[2])
                 evalue = float(fields[8])
                 score = float(fields[9])
@@ -479,6 +493,7 @@ class FoldseekSearcher:
                 send = int(fields[7])
 
                 hit = [query, target, evalue, score, qstart, qend, sstart, send, pident, qcov, scov]
+                prev_query = query
                 yield hit # hit
         return
 
