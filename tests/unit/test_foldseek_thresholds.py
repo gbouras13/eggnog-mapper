@@ -75,7 +75,7 @@ class _Searcher:
             query_cov=None, subject_cov=None,
             cpu=1, temp_dir="/tmp", ss_12st=1, profiles=False,
             evalue_nn_mode=None, evalue_12st_profile_comp=None,
-            use_reverse_score=1,
+            use_reverse_score=1, k_score=None,
         )
         defaults.update(attrs)
         for k, v in defaults.items():
@@ -128,6 +128,17 @@ def test_evalue_above_foldseek_default_reaches_the_search(monkeypatch):
 def test_no_evalue_flag_when_threshold_unset(monkeypatch):
     cmd = _build_search_cmd(_Searcher(evalue_thr=None), monkeypatch)
     assert " -e " not in cmd
+
+
+def test_k_score_is_passed_to_foldseek_search(monkeypatch):
+    cmd = _build_search_cmd(
+        _Searcher(profiles=True, k_score="seq:2147483647,prof:82"), monkeypatch)
+    assert " --k-score seq:2147483647,prof:82 " in cmd
+
+
+def test_no_k_score_flag_when_unset(monkeypatch):
+    cmd = _build_search_cmd(_Searcher(), monkeypatch)
+    assert "--k-score" not in cmd
 
 
 # --------------------------------------------------------------------------

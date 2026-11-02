@@ -355,6 +355,12 @@ def create_arg_parser():
                                    "composition from. 0=center/query sequence, "
                                    "1=recover from profile scores."))
 
+    pg_foldseek.add_argument('--k_score', dest='k_score', default=None, metavar='TWIN',
+                             help=("Foldseek --k-score: k-mer threshold for the prefilter's "
+                                   "similar k-mer lists, as seq:INT,prof:INT. With --profiles "
+                                   "and Foldseek 583229dc we recommend "
+                                   "seq:2147483647,prof:82. Default: Foldseek's own."))
+
     pg_foldseek.add_argument('--use_reverse_score', dest='use_reverse_score', default=1,
                              type=int, choices=[0, 1],
                              help=("Foldseek --use-reverse-score: subtract the reverse "

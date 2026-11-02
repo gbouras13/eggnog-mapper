@@ -151,6 +151,7 @@ class FoldseekSearcher:
         self.evalue_nn_mode = getattr(args, 'evalue_nn_mode', None)
         self.evalue_12st_profile_comp = getattr(args, 'evalue_12st_profile_comp', None)
         self.use_reverse_score = getattr(args, 'use_reverse_score', 1)
+        self.k_score = getattr(args, 'k_score', None)
 
 
 
@@ -390,6 +391,11 @@ class FoldseekSearcher:
         # takes the query composition from.
         if self.profiles and self.evalue_12st_profile_comp is not None:
             cmd += f" --evalue-12st-profile-comp {self.evalue_12st_profile_comp} "
+
+        # Prefilter k-mer threshold. Profile queries need a much lower one than
+        # Foldseek's default to keep their sensitivity.
+        if self.k_score is not None:
+            cmd += f" --k-score {self.k_score} "
 
         # Subtract the reverse-alignment score from the forward score. Foldseek
         # already defaults this to 1; emitted explicitly so the command line
