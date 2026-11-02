@@ -154,12 +154,15 @@ def calc_md5_sum(tarball_path: Path, buffer_size: int = 1024 * 1024) -> str:
             data = fh.read(buffer_size)
     return md5.hexdigest()
 
-def check_model_download(model_dir: Path, model_name: str = MODERNPROST_MODEL) -> bool:
+def check_model_download(model_dir: Path, model_name: str = MODERNPROST_MODEL,
+                         revision: str = None) -> bool:
     """Decide whether the model still has to be fetched from Hugging Face.
 
     Args:
         model_dir (Path): Hugging Face cache directory.
         model_name (str): Repo id of the model.
+        revision (str): Branch, tag or commit hash to require. When None, any
+            cached snapshot will do.
     Returns:
         bool: True when the model is not in the cache yet.
 
@@ -173,18 +176,27 @@ def check_model_download(model_dir: Path, model_name: str = MODERNPROST_MODEL) -
         print(f"{model_name} not found in {model_dir}.")
         return True
 
+    if revision is None:
+        candidates = list(snapshots.iterdir())
+    else:
+        # a branch or tag is cached as refs/<name> holding the commit hash
+        ref = Path(model_dir) / model_sub_dir / "refs" / revision
+        commit = ref.read_text().strip() if ref.is_file() else revision
+        candidates = [snapshots / commit]
+
     # a snapshot dir exists; require the weights and the config to be resolvable
-    for snapshot in snapshots.iterdir():
+    for snapshot in candidates:
         has_config = (snapshot / "config.json").exists()
         has_weights = any(snapshot.glob("*.safetensors")) or any(snapshot.glob("*.bin"))
         if has_config and has_weights:
             return False
 
-    print(f"{model_name} cache in {model_dir} is incomplete.")
+    print(f"{model_name} cache in {model_dir} is incomplete"
+          + (f" for revision {revision}." if revision else "."))
     return True
 
 def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
-              profiles, model_name=MODERNPROST_MODEL):
+              profiles, model_name=MODERNPROST_MODEL, revision=None):
 
     # Dictionary to store the records
     cds_dict = {}
@@ -253,7 +265,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
     localfile = True
     download = False
 
-    download = check_model_download(cache_dir, model_name)
+    download = check_model_download(cache_dir, model_name, revision)
 
     if download is True:
         localfile = False
@@ -261,6 +273,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
 
     model = AutoModel.from_pretrained(
         model_name,
+        revision=revision,
         trust_remote_code=True,
         cache_dir=cache_dir,
         force_download=download,
@@ -272,6 +285,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
+        revision=revision,
         trust_remote_code=True,
         cache_dir=cache_dir,
         force_download=download,
@@ -285,7 +299,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"{model_name} Loaded")
+    print(f"{model_name} Loaded (revision {getattr(model.config, '_commit_hash', None) or revision or 'local'})")
     print(f"{model_name} Total Parameters: {total_params}")
 
     predictions = {}

@@ -374,6 +374,12 @@ def create_arg_parser():
                                    "since both alphabets are model-specific. "
                                    "Default: gbouras13/modernprost-50M-pssm"))
 
+    pg_foldseek.add_argument('--modernprost_revision', dest='modernprost_revision',
+                             default=None, metavar='REVISION',
+                             help=("Branch, tag or commit hash of --modernprost_model to use. "
+                                   "Default: any cached snapshot, else the latest. Pin it to "
+                                   "keep results reproducible when the model repo is updated."))
+
     pg_foldseek.add_argument('--hf_cache_dir', dest="hf_cache_dir", metavar='HF_CACHE_DIR',
                              help=("Hugging Face cache directory holding the ModernProst model. "
                                    "Default: the 'foldseek' dir inside the eggNOG data dir."))

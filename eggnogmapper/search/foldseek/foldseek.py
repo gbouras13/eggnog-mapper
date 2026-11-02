@@ -140,6 +140,7 @@ class FoldseekSearcher:
         # HF cache defaults to the 'foldseek' dir inside the eggNOG data dir
         self.hf_cache_dir = getattr(args, 'hf_cache_dir', None) or get_hf_cache_dir()
         self.modernprost_model = getattr(args, 'modernprost_model', None) or MODERNPROST_MODEL
+        self.modernprost_revision = getattr(args, 'modernprost_revision', None)
 
         # 12-state structural alphabet. Two on-disk forms, both understood by
         # Foldseek (structurealign.cpp: queryHas12St = query3Di12St || q12StDbr):
@@ -293,13 +294,15 @@ class FoldseekSearcher:
             # create profiles
             infer_3Di(fasta_file, self.out_dir, cache_dir, self.batch_size,
                       self.max_batch_residues, profiles=True,
-                      model_name=self.modernprost_model)
+                      model_name=self.modernprost_model,
+                      revision=self.modernprost_revision)
 
         else:
             output_3di, output_12st = infer_3Di(
                 fasta_file, self.out_dir, cache_dir, self.batch_size,
                 self.max_batch_residues, profiles=False,
-                model_name=self.modernprost_model)
+                model_name=self.modernprost_model,
+                revision=self.modernprost_revision)
 
             if self.ss_12st == 0:
                 # user asked for 3Di only; write a legacy single-alphabet _ss
