@@ -13,7 +13,7 @@ import hashlib
 
 from ...emapperException import EmapperException
 from .profiles import generate_mmseqs_db_from_aa, computeLogPSSM, toBuffer_pssm, \
-    toBuffer_pssm_states, write_ss12_profile_db, BACKPROBS_12ST, \
+    toBuffer_pssm_states, write_ss12_profile_db, BACKPROBS_12ST, PROFILE_RECORD_END, \
     build_database_seq, copy_and_create_extras, sort_index_file, remove_file
 from .create_fs_db import ALPHABET_3DI, ALPHABET_12ST, clean_aa_sequence
 
@@ -197,6 +197,15 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
     if not cds_dict:
         print(f"No amino acid sequences found in {in_fasta}") # dont use logger, use print to match the rest of it
 
+    # Drop trailing stop codons and normalise internal ones; create_fs_db
+    # applies the same function to the amino-acid database. Done before the
+    # --profiles amino-acid database is built from cds_dict, so the AA, 3Di and
+    # 12-state profiles of a query all have one column per residue.
+    # Residues the tokenizer has no token for would otherwise become <unk>,
+    # which the model was not trained on.
+    cds_dict = {k: clean_aa_sequence(v).replace("U", "X").replace("Z", "X").replace("O", "X")
+                for k, v in cds_dict.items()}
+
     sys.path.append(cache_dir)
 
 
@@ -314,13 +323,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
     chunk_len = 1568 # set to 1568 chunk length
 
     for seq_idx, (id, seq) in tqdm(enumerate(cds_dict.items(), 1), total=len(cds_dict), desc="Predicting 3Di"):
-        # Drop trailing stop codons and normalise internal ones; create_fs_db
-        # applies the same function to the amino-acid database, so the AA, 3Di
-        # and 12-state strings for a query stay the same length.
-        seq = clean_aa_sequence(seq)
-        # Residues the tokenizer has no token for would otherwise become <unk>,
-        # which the model was not trained on.
-        seq = seq.replace("U", "X").replace("Z", "X").replace("O", "X")
+        # already cleaned above
         slen = len(seq)
 
 
@@ -586,7 +589,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
 
             key = lookup[identifier]            # mmseqs numeric id
 
-            buf = toBuffer_pssm(logPSSM, consensus)
+            buf = toBuffer_pssm(logPSSM, consensus) + PROFILE_RECORD_END
             buf_length = len(buf)
 
             parts.append(buf)

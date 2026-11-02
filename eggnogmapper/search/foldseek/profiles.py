@@ -157,7 +157,10 @@ Y -1.7640 -2.4071 -3.0650 -2.0205  2.9391 -3.0398  1.6926 -1.3314 -1.8200 -1.062
 X -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000 -1.0000
 """
 
-AAs = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'X']
+# Foldseek/MMseqs2 amino-acid indices (X = 20). The query and consensus bytes
+# of an amino-acid profile column index this alphabet; an extra 'O' before 'P'
+# would shift P..Y by one.
+AAs = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'X']
 
 backprobs = [0.0489372, 0.0306991, 0.101049, 0.0329671, 0.0276149,
              0.0416262, 0.0452521, 0.030876, 0.0297251, 0.0607036,
@@ -186,6 +189,10 @@ PROFILE_AA_SIZE = 20
 PROFILE_READIN_SIZE = 25
 # MMseqs DBTYPE_HMM_PROFILE
 DBTYPE_HMM_PROFILE = 2
+# Foldseek writes a null byte after every profile record and reads the length
+# back as (bytes - 1) / PROFILE_READIN_SIZE (DBReader::getSeqLen), so a record
+# without it is read one residue short.
+PROFILE_RECORD_END = b"\0"
 
 def parse_profile_from_block(block_lines):
     # Skip the first two header lines (header and amino acid header)
@@ -326,6 +333,7 @@ def write_ss12_profile_db(entries, out_db):
     """
     parts, index_lines, offset = [], [], 0
     for key, buf in entries:
+        buf += PROFILE_RECORD_END
         parts.append(buf)
         index_lines.append(f"{key}\t{offset}\t{len(buf)}")
         offset += len(buf)
@@ -431,9 +439,6 @@ def precompute_sub_blocks(sub_matrix):
     blocks = {}
 
     for aa, row in sub_matrix.items():
-        if aa == 'X':
-            continue
-
         row = np.asarray(row, dtype=np.float32)
 
         scaled = row * 4.0
@@ -458,12 +463,11 @@ def precompute_sub_blocks(sub_matrix):
 def generate_profile_for_sequence(seq, sub_blocks):
     out = bytearray()
 
+    # One column per residue, X included: Foldseek reads this profile with the
+    # length of the 3Di one, so skipping a residue would put every later column
+    # out of register with its 3Di and 12-state columns.
     for res in seq:
-        aa = res.upper()
-        block = sub_blocks.get(aa)
-        if block is None:
-            continue  #  X-skip 
-        out.extend(block)
+        out.extend(sub_blocks.get(res.upper(), sub_blocks['X']))
 
     return out
 
@@ -477,7 +481,7 @@ def build_database_seq(seq_db_file, seq_index_file, output_db="profile", output_
     # for key, seq in tqdm(seqs, desc="Processing sequences"):
     for key, seq in seqs:
         profile = generate_profile_for_sequence(seq, sub_blocks)
-        packed = pack_profile_seq(profile)
+        packed = pack_profile_seq(profile) + PROFILE_RECORD_END
         parts.append(packed)
         length = len(packed)
         index_lines.append(f"{key}\t{current_offset}\t{length}")
