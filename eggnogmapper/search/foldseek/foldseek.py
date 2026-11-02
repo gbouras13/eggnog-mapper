@@ -22,6 +22,7 @@ from ..diamond.diamond import hit_does_overlap, ALLOW_OVERLAPS_ALL
 
 from .inference import infer_3Di, MODERNPROST_MODEL
 from .create_fs_db import generate_foldseek_db_from_aa_3di, db_has_12st
+from .plddt import mask_query_profiles
 
 
 def create_foldseek_db(dbprefix, in_fasta):
@@ -141,6 +142,13 @@ class FoldseekSearcher:
         self.hf_cache_dir = getattr(args, 'hf_cache_dir', None) or get_hf_cache_dir()
         self.modernprost_model = getattr(args, 'modernprost_model', None) or MODERNPROST_MODEL
         self.modernprost_revision = getattr(args, 'modernprost_revision', None)
+
+        # Zero the 3Di and 12-state profile columns of query residues whose
+        # predicted pLDDT is below this. Profiles only: masking a discrete
+        # query would need a masked state the 12-state alphabet does not have.
+        self.plddt_mask = getattr(args, 'plddt_mask', None)
+        if self.plddt_mask is not None and not self.profiles:
+            raise EmapperException("--plddt_mask requires --profiles")
 
         # 12-state structural alphabet. Two on-disk forms, both understood by
         # Foldseek (structurealign.cpp: queryHas12St = query3Di12St || q12StDbr):
@@ -295,7 +303,12 @@ class FoldseekSearcher:
             infer_3Di(fasta_file, self.out_dir, cache_dir, self.batch_size,
                       self.max_batch_residues, profiles=True,
                       model_name=self.modernprost_model,
-                      revision=self.modernprost_revision)
+                      revision=self.modernprost_revision,
+                      plddt_threshold=self.plddt_mask)
+            if self.plddt_mask is not None:
+                profile_db = Path(self.out_dir) / "query_profiledb" / "query_profile"
+                for cmd in mask_query_profiles(profile_db, f"{profile_db}_marks", self.cpu):
+                    print(colorify('  '+cmd, 'yellow'))
 
         else:
             output_3di, output_12st = infer_3Di(

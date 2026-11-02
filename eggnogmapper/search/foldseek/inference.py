@@ -16,6 +16,7 @@ from .profiles import generate_mmseqs_db_from_aa, computeLogPSSM, toBuffer_pssm,
     toBuffer_pssm_states, write_ss12_profile_db, BACKPROBS_12ST, PROFILE_RECORD_END, \
     build_database_seq, copy_and_create_extras, sort_index_file, remove_file
 from .create_fs_db import ALPHABET_3DI, ALPHABET_12ST, clean_aa_sequence
+from .plddt import load_plddt_head, write_plddt_tsv, write_marks_db
 
 # ModernProst checkpoint used to predict the structural alphabets from sequence.
 # ModernProst3Di12StModel has two heads and returns logits as a dict:
@@ -196,7 +197,8 @@ def check_model_download(model_dir: Path, model_name: str = MODERNPROST_MODEL,
     return True
 
 def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
-              profiles, model_name=MODERNPROST_MODEL, revision=None):
+              profiles, model_name=MODERNPROST_MODEL, revision=None,
+              plddt_threshold=None):
 
     # Dictionary to store the records
     cds_dict = {}
@@ -298,6 +300,18 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
     model.to(device)
     model.eval()
 
+    # pLDDT head for --plddt_mask; kept in float32, it casts the backbone's
+    # half-precision layer outputs itself
+    plddt_head = None
+    if plddt_threshold is not None:
+        plddt_module, plddt_head = load_plddt_head(
+            model_name, cache_dir, revision, device, local_files_only=localfile)
+        print(f"{model_name} pLDDT head loaded: profile columns with predicted "
+              f"pLDDT < {plddt_threshold:g} will be masked")
+    # per-residue pLDDT, and per chunk for proteins split into chunks
+    plddt_store = {}
+    plddt_chunks = {}
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"{model_name} Loaded (revision {getattr(model.config, '_commit_hash', None) or revision or 'local'})")
     print(f"{model_name} Total Parameters: {total_params}")
@@ -383,7 +397,13 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
             
             try:
                 with torch.no_grad():
-                    outputs = model(**inputs)
+                    if plddt_head is not None:
+                        # one backbone pass gives the profiles and the pLDDT
+                        plddt, outputs = plddt_module.predict_plddt(
+                            model, plddt_head, inputs["input_ids"], inputs["attention_mask"])
+                        plddt = plddt.float().cpu().numpy()  # (B, L)
+                    else:
+                        outputs = model(**inputs)
             except RuntimeError:
                 print(f" number of residues in batch {n_res_batch}")
                 print(f" seq length is {slen}")
@@ -445,6 +465,9 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
                         base_id, chunk_tag = identifier.split("__chunk")
                         chunk_idx = int(chunk_tag)
 
+                        if plddt_head is not None:
+                            plddt_chunks.setdefault(base_id, {})[chunk_idx] = plddt[batch_idx, :s_len]
+
                         if base_id not in chunk_store:
                             chunk_store[base_id] = {}
 
@@ -471,6 +494,9 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
                         
                     else:
                         mean_prob = round(100 * max_probabilities[batch_idx, 0:s_len].mean().item(), 2)
+
+                        if plddt_head is not None:
+                            plddt_store[identifier] = plddt[batch_idx, :s_len]
                     
 
                         batch_predictions[identifier] = (
@@ -552,6 +578,9 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
             preds12_full,
             all_probs12_full
         )
+
+    for pid, chunks in plddt_chunks.items():
+        plddt_store[pid] = np.concatenate([chunks[idx] for idx in sorted(chunks)])
 
     # Sort back in order of the original dictionary
     for k in original_keys:
@@ -666,6 +695,19 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
 
 
         print(f"Finished writing 3di PSSM Foldseek profile to '{pssm_db_builder['seq_output_db']}'")
+
+        if plddt_head is not None:
+            plddt_tsv = Path(output_dir) / "input_plddt.tsv"
+            write_plddt_tsv({k: plddt_store[k] for k in predictions}, plddt_tsv)
+            print(f"Finished writing predicted pLDDT to '{plddt_tsv}'")
+
+            # keyed like the profiles, for foldseek lowconfquery (run by the searcher)
+            marks_db = f"{pssm_db_builder['seq_output_db']}_marks"
+            marks = sorted(((lookup[k], cds_dict[k], plddt_store[k]) for k in predictions),
+                           key=lambda e: int(e[0]))
+            n_low, n_res = write_marks_db(marks, marks_db, plddt_threshold)
+            print(f"{n_low:,} of {n_res:,} residues ({100 * n_low / max(n_res, 1):.1f}%) have "
+                  f"predicted pLDDT < {plddt_threshold:g}; marked in '{marks_db}'")
 
     # the 12-state FASTA only exists when the model has a 12st head
     return output_3di, (output_12st if Path(output_12st).exists() else None)
