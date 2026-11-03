@@ -37,22 +37,59 @@ def test_marks_reject_length_mismatch(tmp_path):
 
 
 
-def test_profiles_mask_at_50_by_default():
+
+def test_mask_at_50_by_default():
     assert pl.resolve_plddt_mask(None, profiles=True) == 50.0
+    assert pl.resolve_plddt_mask(None, profiles=False, ss_12st=1) == 50.0
 
 
 def test_plddt_mask_overrides_and_zero_turns_it_off():
     assert pl.resolve_plddt_mask(60.0, profiles=True) == 60.0
+    assert pl.resolve_plddt_mask(60.0, profiles=False, ss_12st=1) == 60.0
     assert pl.resolve_plddt_mask(0.0, profiles=True) is None
+    assert pl.resolve_plddt_mask(0.0, profiles=False, ss_12st=1) is None
 
 
-def test_no_masking_without_profiles():
-    assert pl.resolve_plddt_mask(None, profiles=False) is None
-    assert pl.resolve_plddt_mask(0.0, profiles=False) is None
-    with pytest.raises(EmapperException, match="--profiles"):
-        pl.resolve_plddt_mask(50.0, profiles=False)
+def test_3di_only_queries_cannot_be_masked():
+    # only the packed 3Di+12-state alphabet has a masked state
+    assert pl.resolve_plddt_mask(None, profiles=False, ss_12st=0) is None
+    assert pl.resolve_plddt_mask(0.0, profiles=False, ss_12st=0) is None
+    with pytest.raises(EmapperException, match="--ss_12st"):
+        pl.resolve_plddt_mask(50.0, profiles=False, ss_12st=0)
 
 
 def test_negative_plddt_mask_is_rejected():
     with pytest.raises(EmapperException):
         pl.resolve_plddt_mask(-1.0, profiles=True)
+
+
+def _write_db(prefix, records):
+    off = 0
+    with open(prefix, "wb") as fd, open(f"{prefix}.index", "w") as fi:
+        for key, rec in records:
+            fd.write(rec)
+            fi.write(f"{key}\t{off}\t{len(rec)}\n")
+            off += len(rec)
+
+
+def test_marks_follow_the_query_db_keys(tmp_path):
+    querydb = str(tmp_path / "q")
+    # keys 1..N in FASTA order, as generate_foldseek_db_from_aa_3di writes them
+    _write_db(querydb, [("1", b"MKT\n\0"), ("2", b"AYX\n\0")])
+    _write_db(f"{querydb}_h", [("1", b"protB some desc\n\0"), ("2", b"protA\n\0")])
+    plddts = {"protA": [10.0, 90.0, 20.0], "protB": [80.0, 30.0, 70.0]}
+    tsv = tmp_path / "input_plddt.tsv"
+    pl.write_plddt_tsv(plddts, tsv)
+    entries = pl.marks_from_querydb(querydb, pl.read_plddt_tsv(tsv))
+    assert entries == [("1", "MKT", [80.0, 30.0, 70.0]), ("2", "AYX", [10.0, 90.0, 20.0])]
+    out = str(tmp_path / "q_marks")
+    assert pl.write_marks_db(entries, out, 50) == (3, 6)
+    assert _read_db(out) == {"1": b"MkT\n\0", "2": b"aYx\n\0"}
+
+
+def test_marks_need_a_plddt_for_every_query(tmp_path):
+    querydb = str(tmp_path / "q")
+    _write_db(querydb, [("1", b"MKT\n\0")])
+    _write_db(f"{querydb}_h", [("1", b"protB\n\0")])
+    with pytest.raises(EmapperException, match="protB"):
+        pl.marks_from_querydb(querydb, {})

@@ -1,15 +1,17 @@
 ##
 ## Gbouras 2026
 
-# Masking low-confidence residues of --profiles queries by predicted pLDDT.
+# Masking low-confidence query residues by predicted pLDDT.
 #
 # The ModernProst repos ship an optional per-residue pLDDT head in a
 # plddt_head/ subfolder (plddt_head.py, head_config.json, head.safetensors).
 # It reads the frozen backbone's encoder layers, so pLDDT comes out of the same
-# forward pass as the profiles. Residues predicted below the threshold are
-# lowercased in a "marks" amino-acid database keyed like the query profiles,
-# and `foldseek lowconfquery` then zeroes their 3Di and 12-state profile
-# columns. The amino-acid profile is not masked.
+# forward pass as the structural alphabets. Residues predicted below the
+# threshold are lowercased in a "marks" amino-acid database keyed like the
+# query database, and `foldseek lowconfquery` then masks them in the query's
+# structural channels: profile queries (--profiles) get their 3Di (_ss) and
+# 12-state (_ss12) columns zeroed, discrete queries get their packed
+# 3Di+12-state residue set to X. The amino-acid channel is not masked.
 
 import importlib.util
 import os
@@ -23,28 +25,31 @@ from ...emapperException import EmapperException
 from .profiles import PROFILE_RECORD_END
 
 PLDDT_HEAD_SUBFOLDER = "plddt_head"
-# Predicted-pLDDT threshold applied to --profiles queries unless --plddt_mask
+# Predicted-pLDDT threshold applied to Foldseek queries unless --plddt_mask
 # says otherwise (0 turns masking off)
 PLDDT_MASK_DEFAULT = 50.0
 # MMseqs DBTYPE_AMINO_ACIDS
 DBTYPE_AMINO_ACIDS = 0
 
 
-def resolve_plddt_mask(plddt_mask, profiles):
+def resolve_plddt_mask(plddt_mask, profiles, ss_12st=1):
     """The masking threshold to use, or None for no masking.
 
-    plddt_mask is the --plddt_mask value (None when not given). With --profiles
-    it defaults to PLDDT_MASK_DEFAULT and 0 turns it off; without --profiles
-    there is nothing to mask, so asking for a threshold is an error.
+    plddt_mask is the --plddt_mask value (None when not given); it defaults to
+    PLDDT_MASK_DEFAULT and 0 turns masking off. Discrete queries can only be
+    masked in the packed 3Di+12-state form (Foldseek has a masked state only
+    there), so with --ss_12st 0 the default is no masking and asking for a
+    threshold is an error.
     """
-    if not profiles:
+    if plddt_mask is not None and plddt_mask < 0:
+        raise EmapperException(f"--plddt_mask must be >= 0, not {plddt_mask:g}")
+    if not profiles and not ss_12st:
         if plddt_mask:
-            raise EmapperException("--plddt_mask requires --profiles")
+            raise EmapperException(
+                "--plddt_mask needs --profiles or the 12-state alphabet (--ss_12st 1)")
         return None
     if plddt_mask is None:
         plddt_mask = PLDDT_MASK_DEFAULT
-    if plddt_mask < 0:
-        raise EmapperException(f"--plddt_mask must be >= 0, not {plddt_mask:g}")
     return plddt_mask if plddt_mask > 0 else None
 
 
@@ -72,7 +77,7 @@ def load_plddt_head(model_name, cache_dir, revision=None, device="cpu", local_fi
         except Exception as e:
             raise EmapperException(
                 f"{model_name} has no pLDDT head ({PLDDT_HEAD_SUBFOLDER}/plddt_head.py), "
-                f"which --profiles needs to mask low-confidence residues; use "
+                f"which --plddt_mask needs to mask low-confidence residues; use "
                 f"--plddt_mask 0 to search without masking: {e}")
 
     spec = importlib.util.spec_from_file_location("modernprost_plddt_head", code)
@@ -91,11 +96,51 @@ def write_plddt_tsv(plddts, out_tsv):
     return
 
 
+def read_plddt_tsv(in_tsv):
+    """Read write_plddt_tsv output back: {id: [pLDDT, ...]}."""
+    plddts = {}
+    with open(in_tsv) as fh:
+        for line in fh:
+            seq_id, values = line.rstrip("\n").split("\t")
+            plddts[seq_id] = [float(v) for v in values.split(",")] if values else []
+    return plddts
+
+
+def _read_db_records(db_prefix):
+    """{key: record} of an MMseqs database, without the trailing newline and null byte."""
+    with open(db_prefix, "rb") as fh:
+        data = fh.read()
+    records = {}
+    with open(f"{db_prefix}.index") as fh:
+        for line in fh:
+            key, offset, length = line.split("\t")
+            offset, length = int(offset), int(length)
+            records[key] = data[offset:offset + length].rstrip(b"\x00").rstrip(b"\n")
+    return records
+
+
+def marks_from_querydb(querydb, plddts):
+    """(key, sequence, pLDDT values) for every entry of a Foldseek query database.
+
+    Sequences come from the database's amino-acid records and ids from its _h
+    headers, so the marks line up with its keys and residues by construction.
+    """
+    seqs = _read_db_records(querydb)
+    headers = _read_db_records(f"{querydb}_h")
+    entries = []
+    for key in sorted(seqs, key=int):
+        seq_id = headers[key].decode().split()[0]
+        if seq_id not in plddts:
+            raise EmapperException(f"No predicted pLDDT for query {seq_id}")
+        entries.append((key, seqs[key].decode(), plddts[seq_id]))
+    return entries
+
+
 def write_marks_db(entries, out_db, threshold):
     """Write the amino-acid "marks" database read by `foldseek lowconfquery`.
 
     entries: iterable of (key, sequence, pLDDT values) in key order, keyed like
-    the query profile databases. A residue is lowercased where its pLDDT is
+    the query database. A residue is lowercased where its pLDDT is
     below threshold, which is what lowconfquery masks.
 
     Returns (masked residues, total residues).
@@ -126,14 +171,17 @@ def write_marks_db(entries, out_db, threshold):
     return n_low, n_res
 
 
-def mask_query_profiles(profile_db, marks_db, threads):
-    """Zero the 3Di (_ss) and 12-state (_ss12) profile columns marked in marks_db, in place.
+def mask_query_db(query_db, marks_db, threads):
+    """Mask the residues marked in marks_db in a query's structural channels, in place.
+
+    A profile query has its 3Di (_ss) and 12-state (_ss12) columns zeroed; a
+    discrete query has its packed 3Di+12-state residues (_ss) set to X.
 
     Returns the commands run.
     """
     cmds = []
     for suffix in ("_ss", "_ss12"):
-        db = f"{profile_db}{suffix}"
+        db = f"{query_db}{suffix}"
         if not os.path.exists(f"{db}.index"):
             continue
         full = f"{db}_full"

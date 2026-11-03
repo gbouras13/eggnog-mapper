@@ -306,7 +306,7 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
     if plddt_threshold is not None:
         plddt_module, plddt_head = load_plddt_head(
             model_name, cache_dir, revision, device, local_files_only=localfile)
-        print(f"{model_name} pLDDT head loaded: profile columns with predicted "
+        print(f"{model_name} pLDDT head loaded: query residues with predicted "
               f"pLDDT < {plddt_threshold:g} will be masked")
     # per-residue pLDDT, and per chunk for proteins split into chunks
     plddt_store = {}
@@ -605,6 +605,11 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
 
     write_predictions(predictions, output_3di, output_12st)
 
+    if plddt_head is not None:
+        plddt_tsv = Path(output_dir) / "input_plddt.tsv"
+        write_plddt_tsv({k: plddt_store[k] for k in predictions}, plddt_tsv)
+        print(f"Finished writing predicted pLDDT to '{plddt_tsv}'")
+
     if profiles:
 
         print("You used --profiles")
@@ -697,10 +702,6 @@ def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
         print(f"Finished writing 3di PSSM Foldseek profile to '{pssm_db_builder['seq_output_db']}'")
 
         if plddt_head is not None:
-            plddt_tsv = Path(output_dir) / "input_plddt.tsv"
-            write_plddt_tsv({k: plddt_store[k] for k in predictions}, plddt_tsv)
-            print(f"Finished writing predicted pLDDT to '{plddt_tsv}'")
-
             # keyed like the profiles, for foldseek lowconfquery (run by the searcher)
             marks_db = f"{pssm_db_builder['seq_output_db']}_marks"
             marks = sorted(((lookup[k], cds_dict[k], plddt_store[k]) for k in predictions),

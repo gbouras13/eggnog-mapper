@@ -22,7 +22,8 @@ from ..diamond.diamond import hit_does_overlap, ALLOW_OVERLAPS_ALL
 
 from .inference import infer_3Di, MODERNPROST_MODEL
 from .create_fs_db import generate_foldseek_db_from_aa_3di, db_has_12st
-from .plddt import mask_query_profiles, resolve_plddt_mask
+from .plddt import mask_query_db, resolve_plddt_mask, read_plddt_tsv, \
+    marks_from_querydb, write_marks_db
 
 
 def create_foldseek_db(dbprefix, in_fasta):
@@ -143,18 +144,18 @@ class FoldseekSearcher:
         self.modernprost_model = getattr(args, 'modernprost_model', None) or MODERNPROST_MODEL
         self.modernprost_revision = getattr(args, 'modernprost_revision', None)
 
-        # Zero the 3Di and 12-state profile columns of query residues whose
-        # predicted pLDDT is below this (None: no masking). Profiles only:
-        # masking a discrete query would need a masked state the 12-state
-        # alphabet does not have.
-        self.plddt_mask = resolve_plddt_mask(getattr(args, 'plddt_mask', None),
-                                             self.profiles)
 
         # 12-state structural alphabet. Two on-disk forms, both understood by
         # Foldseek (structurealign.cpp: queryHas12St = query3Di12St || q12StDbr):
         #   discrete queries  - packed into the _ss db, one byte per residue
         #   --profiles        - a sibling <querydb>_ss12 PSSM database
         self.ss_12st = getattr(args, 'ss_12st', 1)
+
+        # Mask query residues whose predicted pLDDT is below this (None: no
+        # masking): zeroed 3Di and 12-state columns for --profiles, the masked
+        # packed 3Di+12-state state for discrete queries.
+        self.plddt_mask = resolve_plddt_mask(getattr(args, 'plddt_mask', None),
+                                             self.profiles, self.ss_12st)
 
         # E-value calibration / scoring options (see search_step)
         self.evalue_nn_mode = getattr(args, 'evalue_nn_mode', None)
@@ -307,7 +308,7 @@ class FoldseekSearcher:
                       plddt_threshold=self.plddt_mask)
             if self.plddt_mask is not None:
                 profile_db = Path(self.out_dir) / "query_profiledb" / "query_profile"
-                for cmd in mask_query_profiles(profile_db, f"{profile_db}_marks", self.cpu):
+                for cmd in mask_query_db(profile_db, f"{profile_db}_marks", self.cpu):
                     print(colorify('  '+cmd, 'yellow'))
 
         else:
@@ -315,7 +316,8 @@ class FoldseekSearcher:
                 fasta_file, self.out_dir, cache_dir, self.batch_size,
                 self.max_batch_residues, profiles=False,
                 model_name=self.modernprost_model,
-                revision=self.modernprost_revision)
+                revision=self.modernprost_revision,
+                plddt_threshold=self.plddt_mask)
 
             if self.ss_12st == 0:
                 # user asked for 3Di only; write a legacy single-alphabet _ss
@@ -332,6 +334,16 @@ class FoldseekSearcher:
                 fasta_file, output_3di, self.temp_dir, querydb,
                 fasta_12st=output_12st
             )
+
+            if self.plddt_mask is not None:
+                plddts = read_plddt_tsv(Path(self.out_dir) / "input_plddt.tsv")
+                marks_db = f"{querydb}_marks"
+                n_low, n_res = write_marks_db(marks_from_querydb(querydb, plddts),
+                                              marks_db, self.plddt_mask)
+                print(f"{n_low:,} of {n_res:,} residues ({100 * n_low / max(n_res, 1):.1f}%) have "
+                      f"predicted pLDDT < {self.plddt_mask:g}; set to X in the query 3Di+12-state")
+                for cmd in mask_query_db(querydb, marks_db, self.cpu):
+                    print(colorify('  '+cmd, 'yellow'))
 
         # mmseqs createdb examples/QUERY.fasta queryDB
         # cmd = (
