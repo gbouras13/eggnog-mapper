@@ -393,6 +393,15 @@ def create_arg_parser():
     pg_foldseek.add_argument('--profiles', action="store_true",
                              help="Use modernprost-profiles for the Foldseek query DB")
 
+    pg_foldseek.add_argument('--foldseek_predictions', dest='foldseek_predictions', default=None,
+                             metavar='DIR',
+                             help=("Search with the ModernProst predictions (input_3di.fasta, "
+                                   "input_12st.fasta and, for --plddt_mask, input_plddt.tsv) an "
+                                   "earlier run on the same input wrote to its output dir, instead "
+                                   "of predicting again; e.g. predict on a GPU node and search "
+                                   "elsewhere. They must come from the same --modernprost_model. "
+                                   "Not supported with --profiles."))
+
     pg_foldseek.add_argument('--plddt_mask', dest='plddt_mask', default=None, type=float,
                              metavar='PLDDT',
                              help=("Mask Foldseek query residues whose pLDDT, predicted by the "

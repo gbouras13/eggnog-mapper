@@ -196,6 +196,45 @@ def check_model_download(model_dir: Path, model_name: str = MODERNPROST_MODEL,
           + (f" for revision {revision}." if revision else "."))
     return True
 
+def load_predictions(pred_dir, in_fasta, need_plddt):
+    """Reuse the ModernProst outputs an earlier run wrote to its output dir.
+
+    Returns (3Di FASTA, 12-state FASTA or None, pLDDT TSV or None), the files
+    infer_3Di writes, after checking that they cover the queries in in_fasta:
+    every query must have a 3Di prediction unless the earlier run listed it in
+    its fails.tsv, and no prediction may be for a protein not in in_fasta.
+    """
+    pred_dir = Path(pred_dir)
+    output_3di = pred_dir / "input_3di.fasta"
+    output_12st = pred_dir / "input_12st.fasta"
+    plddt_tsv = pred_dir / "input_plddt.tsv"
+    fails_tsv = pred_dir / "fails.tsv"
+
+    if not output_3di.exists():
+        raise EmapperException(f"No ModernProst predictions ({output_3di.name}) in {pred_dir}")
+    if need_plddt and not plddt_tsv.exists():
+        raise EmapperException(
+            f"No predicted pLDDT ({plddt_tsv.name}) in {pred_dir}, which pLDDT masking needs: "
+            f"predict with the pLDDT head, or use --plddt_mask 0")
+
+    query_ids = {record.id for record in SeqIO.parse(in_fasta, "fasta")}
+    predicted_ids = {record.id for record in SeqIO.parse(output_3di, "fasta")}
+    failed_ids = set()
+    if fails_tsv.exists():
+        with open(fails_tsv) as fh:
+            failed_ids = {line.strip() for line in fh if line.strip()}
+    missing = query_ids - predicted_ids - failed_ids
+    extra = predicted_ids - query_ids
+    if missing or extra:
+        raise EmapperException(
+            f"The predictions in {pred_dir} do not match {in_fasta}: {len(missing)} queries "
+            f"without a prediction, {len(extra)} predictions for other proteins")
+
+    print(f"Reusing ModernProst predictions for {len(predicted_ids):,} queries from {pred_dir}")
+    return (output_3di, output_12st if output_12st.exists() else None,
+            plddt_tsv if need_plddt else None)
+
+
 def infer_3Di(in_fasta, output_dir, cache_dir, batch_size, max_batch_residues,
               profiles, model_name=MODERNPROST_MODEL, revision=None,
               plddt_threshold=None):

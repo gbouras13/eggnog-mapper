@@ -20,7 +20,7 @@ from ..hmmer.hmmer_seqio import iter_fasta_seqs
 from ..hits_io import output_seeds
 from ..diamond.diamond import hit_does_overlap, ALLOW_OVERLAPS_ALL
 
-from .inference import infer_3Di, MODERNPROST_MODEL
+from .inference import infer_3Di, load_predictions, MODERNPROST_MODEL
 from .create_fs_db import generate_foldseek_db_from_aa_3di, db_has_12st
 from .plddt import mask_query_db, resolve_plddt_mask, read_plddt_tsv, \
     marks_from_querydb, write_marks_db
@@ -156,6 +156,12 @@ class FoldseekSearcher:
         # packed 3Di+12-state state for discrete queries.
         self.plddt_mask = resolve_plddt_mask(getattr(args, 'plddt_mask', None),
                                              self.profiles, self.ss_12st)
+
+        # ModernProst outputs of an earlier run to search with instead of
+        # predicting again, e.g. predicted on a GPU node and searched elsewhere
+        self.foldseek_predictions = getattr(args, 'foldseek_predictions', None)
+        if self.foldseek_predictions and self.profiles:
+            raise EmapperException("--foldseek_predictions is not supported with --profiles")
 
         # E-value calibration / scoring options (see search_step)
         self.evalue_nn_mode = getattr(args, 'evalue_nn_mode', None)
@@ -311,6 +317,9 @@ class FoldseekSearcher:
                 for cmd in mask_query_db(profile_db, f"{profile_db}_marks", self.cpu):
                     print(colorify('  '+cmd, 'yellow'))
 
+        elif self.foldseek_predictions:
+            output_3di, output_12st, plddt_tsv = load_predictions(
+                self.foldseek_predictions, fasta_file, self.plddt_mask is not None)
         else:
             output_3di, output_12st = infer_3Di(
                 fasta_file, self.out_dir, cache_dir, self.batch_size,
@@ -318,6 +327,9 @@ class FoldseekSearcher:
                 model_name=self.modernprost_model,
                 revision=self.modernprost_revision,
                 plddt_threshold=self.plddt_mask)
+            plddt_tsv = Path(self.out_dir) / "input_plddt.tsv"
+
+        if not self.profiles:
 
             if self.ss_12st == 0:
                 # user asked for 3Di only; write a legacy single-alphabet _ss
@@ -336,7 +348,7 @@ class FoldseekSearcher:
             )
 
             if self.plddt_mask is not None:
-                plddts = read_plddt_tsv(Path(self.out_dir) / "input_plddt.tsv")
+                plddts = read_plddt_tsv(plddt_tsv)
                 marks_db = f"{querydb}_marks"
                 n_low, n_res = write_marks_db(marks_from_querydb(querydb, plddts),
                                               marks_db, self.plddt_mask)
