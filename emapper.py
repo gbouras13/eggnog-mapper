@@ -397,9 +397,10 @@ def create_arg_parser():
                              metavar='PLDDT',
                              help=("With --profiles: zero the 3Di and 12-state profile columns "
                                    "of query residues whose pLDDT, predicted by the model's "
-                                   "pLDDT head, is below this (e.g. 60). The amino-acid profile "
-                                   "is not masked. Needs a model that ships plddt_head/ and a "
-                                   "Foldseek with 'lowconfquery'. Default: no masking."))
+                                   "pLDDT head, is below this. The amino-acid profile is not "
+                                   "masked. Needs a model that ships plddt_head/ and a Foldseek "
+                                   "with 'lowconfquery'. 0 turns masking off. Default: 50 with "
+                                   "--profiles."))
 
     ##
     pg_annot = parser.add_argument_group('Annotation Options')

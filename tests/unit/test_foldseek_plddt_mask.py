@@ -35,3 +35,24 @@ def test_marks_reject_length_mismatch(tmp_path):
     with pytest.raises(EmapperException):
         pl.write_marks_db([("1", "MKT", [90.0, 80.0])], str(tmp_path / "m"), 60)
 
+
+
+def test_profiles_mask_at_50_by_default():
+    assert pl.resolve_plddt_mask(None, profiles=True) == 50.0
+
+
+def test_plddt_mask_overrides_and_zero_turns_it_off():
+    assert pl.resolve_plddt_mask(60.0, profiles=True) == 60.0
+    assert pl.resolve_plddt_mask(0.0, profiles=True) is None
+
+
+def test_no_masking_without_profiles():
+    assert pl.resolve_plddt_mask(None, profiles=False) is None
+    assert pl.resolve_plddt_mask(0.0, profiles=False) is None
+    with pytest.raises(EmapperException, match="--profiles"):
+        pl.resolve_plddt_mask(50.0, profiles=False)
+
+
+def test_negative_plddt_mask_is_rejected():
+    with pytest.raises(EmapperException):
+        pl.resolve_plddt_mask(-1.0, profiles=True)

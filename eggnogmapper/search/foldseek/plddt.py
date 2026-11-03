@@ -23,8 +23,29 @@ from ...emapperException import EmapperException
 from .profiles import PROFILE_RECORD_END
 
 PLDDT_HEAD_SUBFOLDER = "plddt_head"
+# Predicted-pLDDT threshold applied to --profiles queries unless --plddt_mask
+# says otherwise (0 turns masking off)
+PLDDT_MASK_DEFAULT = 50.0
 # MMseqs DBTYPE_AMINO_ACIDS
 DBTYPE_AMINO_ACIDS = 0
+
+
+def resolve_plddt_mask(plddt_mask, profiles):
+    """The masking threshold to use, or None for no masking.
+
+    plddt_mask is the --plddt_mask value (None when not given). With --profiles
+    it defaults to PLDDT_MASK_DEFAULT and 0 turns it off; without --profiles
+    there is nothing to mask, so asking for a threshold is an error.
+    """
+    if not profiles:
+        if plddt_mask:
+            raise EmapperException("--plddt_mask requires --profiles")
+        return None
+    if plddt_mask is None:
+        plddt_mask = PLDDT_MASK_DEFAULT
+    if plddt_mask < 0:
+        raise EmapperException(f"--plddt_mask must be >= 0, not {plddt_mask:g}")
+    return plddt_mask if plddt_mask > 0 else None
 
 
 def load_plddt_head(model_name, cache_dir, revision=None, device="cpu", local_files_only=False):
@@ -51,7 +72,8 @@ def load_plddt_head(model_name, cache_dir, revision=None, device="cpu", local_fi
         except Exception as e:
             raise EmapperException(
                 f"{model_name} has no pLDDT head ({PLDDT_HEAD_SUBFOLDER}/plddt_head.py), "
-                f"which --plddt_mask needs: {e}")
+                f"which --profiles needs to mask low-confidence residues; use "
+                f"--plddt_mask 0 to search without masking: {e}")
 
     spec = importlib.util.spec_from_file_location("modernprost_plddt_head", code)
     module = importlib.util.module_from_spec(spec)
