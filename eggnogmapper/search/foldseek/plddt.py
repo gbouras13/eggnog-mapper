@@ -7,11 +7,12 @@
 # plddt_head/ subfolder (plddt_head.py, head_config.json, head.safetensors).
 # It reads the frozen backbone's encoder layers, so pLDDT comes out of the same
 # forward pass as the structural alphabets. Residues predicted below the
-# threshold are lowercased in a "marks" amino-acid database keyed like the
-# query database, and `foldseek lowconfquery` then masks them in the query's
-# structural channels: profile queries (--profiles) get their 3Di (_ss) and
-# 12-state (_ss12) columns zeroed, discrete queries get their packed
-# 3Di+12-state residue set to X. The amino-acid channel is not masked.
+# threshold are masked in the query's structural channels. Profile queries
+# (--profiles) are lowercased in a "marks" amino-acid database keyed like the
+# query database, and `foldseek lowconfquery` zeroes their 3Di (_ss) and
+# 12-state (_ss12) columns. Discrete queries get their packed 3Di+12-state
+# residue set to X here (mask_packed_query_db). The amino-acid channel is not
+# masked.
 
 import importlib.util
 import os
@@ -30,6 +31,9 @@ PLDDT_HEAD_SUBFOLDER = "plddt_head"
 PLDDT_MASK_DEFAULT = 50.0
 # MMseqs DBTYPE_AMINO_ACIDS
 DBTYPE_AMINO_ACIDS = 0
+# Foldseek Alphabet12St::PACKED_X: the packed 3Di+12-state byte read as X in
+# both alphabets
+PACKED_X = 252
 
 
 def resolve_plddt_mask(plddt_mask, profiles, ss_12st=1):
@@ -171,11 +175,47 @@ def write_marks_db(entries, out_db, threshold):
     return n_low, n_res
 
 
-def mask_query_db(query_db, marks_db, threads):
-    """Mask the residues marked in marks_db in a query's structural channels, in place.
+def mask_packed_query_db(query_db, entries, threshold):
+    """Set the low-pLDDT residues of a packed 3Di+12-state query (_ss) to X, in place.
 
-    A profile query has its 3Di (_ss) and 12-state (_ss12) columns zeroed; a
-    discrete query has its packed 3Di+12-state residues (_ss) set to X.
+    entries: (key, sequence, pLDDT values) as from marks_from_querydb. This is
+    what `foldseek lowconfquery` did to packed databases up to Foldseek
+    583229dc; later Foldseek builds take only profile databases there, so it is
+    done here, independently of the Foldseek version.
+
+    Returns (masked residues, total residues).
+    """
+    ss_db = f"{query_db}_ss"
+    records = _read_db_records(ss_db)
+    n_low = n_res = 0
+    for key, seq, values in entries:
+        rec = bytearray(records[key])
+        if len(rec) != len(values):
+            raise EmapperException(
+                f"Query {key}: {len(rec)} 3Di+12-state residues but {len(values)} pLDDT values")
+        for i, v in enumerate(values):
+            if v < threshold:
+                rec[i] = PACKED_X
+                n_low += 1
+        n_res += len(rec)
+        records[key] = bytes(rec)
+
+    parts, index_lines, offset = [], [], 0
+    for key in sorted(records, key=int):
+        buf = records[key] + b"\n" + PROFILE_RECORD_END
+        parts.append(buf)
+        index_lines.append(f"{key}\t{offset}\t{len(buf)}")
+        offset += len(buf)
+    with open(ss_db, "wb") as fh:
+        fh.write(b"".join(parts))
+    with open(f"{ss_db}.index", "w") as fh:
+        if index_lines:
+            fh.write("\n".join(index_lines) + "\n")
+    return n_low, n_res
+
+
+def mask_query_db(query_db, marks_db, threads):
+    """Zero the 3Di (_ss) and 12-state (_ss12) profile columns marked in marks_db, in place.
 
     Returns the commands run.
     """

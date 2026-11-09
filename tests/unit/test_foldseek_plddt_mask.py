@@ -93,3 +93,20 @@ def test_marks_need_a_plddt_for_every_query(tmp_path):
     _write_db(f"{querydb}_h", [("1", b"protB\n\0")])
     with pytest.raises(EmapperException, match="protB"):
         pl.marks_from_querydb(querydb, {})
+
+
+def test_packed_query_residues_below_threshold_become_x(tmp_path):
+    querydb = str(tmp_path / "q")
+    # packed 3Di+12-state bytes are 0..239, X is 252; records end "\n\0"
+    _write_db(f"{querydb}_ss", [("1", bytes([5, 17, 200]) + b"\n\0"), ("2", bytes([0, 239]) + b"\n\0")])
+    entries = [("1", "MKT", [80.0, 30.0, 49.9]), ("2", "AY", [50.0, 10.0])]
+    assert pl.mask_packed_query_db(querydb, entries, 50) == (3, 5)
+    assert _read_db(f"{querydb}_ss") == {"1": bytes([5, pl.PACKED_X, pl.PACKED_X]) + b"\n\0",
+                                          "2": bytes([0, pl.PACKED_X]) + b"\n\0"}
+
+
+def test_packed_query_mask_rejects_length_mismatch(tmp_path):
+    querydb = str(tmp_path / "q")
+    _write_db(f"{querydb}_ss", [("1", bytes([5, 17]) + b"\n\0")])
+    with pytest.raises(EmapperException):
+        pl.mask_packed_query_db(querydb, [("1", "MKT", [80.0, 30.0, 20.0])], 50)

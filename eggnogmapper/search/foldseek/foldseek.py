@@ -22,8 +22,8 @@ from ..diamond.diamond import hit_does_overlap, ALLOW_OVERLAPS_ALL
 
 from .inference import infer_3Di, load_predictions, MODERNPROST_MODEL
 from .create_fs_db import generate_foldseek_db_from_aa_3di, db_has_12st
-from .plddt import mask_query_db, resolve_plddt_mask, read_plddt_tsv, \
-    marks_from_querydb, write_marks_db
+from .plddt import mask_query_db, mask_packed_query_db, resolve_plddt_mask, \
+    read_plddt_tsv, marks_from_querydb
 
 
 def create_foldseek_db(dbprefix, in_fasta):
@@ -349,13 +349,10 @@ class FoldseekSearcher:
 
             if self.plddt_mask is not None:
                 plddts = read_plddt_tsv(plddt_tsv)
-                marks_db = f"{querydb}_marks"
-                n_low, n_res = write_marks_db(marks_from_querydb(querydb, plddts),
-                                              marks_db, self.plddt_mask)
+                n_low, n_res = mask_packed_query_db(
+                    querydb, marks_from_querydb(querydb, plddts), self.plddt_mask)
                 print(f"{n_low:,} of {n_res:,} residues ({100 * n_low / max(n_res, 1):.1f}%) have "
                       f"predicted pLDDT < {self.plddt_mask:g}; set to X in the query 3Di+12-state")
-                for cmd in mask_query_db(querydb, marks_db, self.cpu):
-                    print(colorify('  '+cmd, 'yellow'))
 
         # mmseqs createdb examples/QUERY.fasta queryDB
         # cmd = (
